@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GabMath Mobile - Cartao</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body data-page="card">
+  <main class="app-shell">
+    <section class="card">
+      <h1>GabMath Mobile</h1>
+      <p class="subtitle">Etapa 2: alinhe o cartao-resposta com calma e so entao inicie a leitura.</p>
+
+      <div class="status-bar">
+        <span id="mode-badge" class="mode-badge">Lendo cartao</span>
+      </div>
+
+      <div class="step">
+        <h2>Cartao-resposta</h2>
+        <div id="proof-summary" class="summary"></div>
+        <p class="hint">Mantenha visiveis os quatro quadrados pretos. A leitura so sera aceita quando a imagem estiver alinhada e nitida.</p>
+        <div class="camera-stack">
+          <video id="camera-video" playsinline muted></video>
+          <canvas id="camera-overlay"></canvas>
+        </div>
+        <div class="actions">
+          <button id="start-scan">Iniciar camera</button>
+          <button id="stop-scan" class="secondary">Parar</button>
+        </div>
+        <button id="start-card-scan" class="full">Iniciar leitura do cartao</button>
+        <p id="scan-status" class="status"></p>
+        <canvas id="aligned-preview" class="aligned-preview"></canvas>
+        <div id="answer-grid" class="answer-grid"></div>
+        <div id="result-panel" class="result hidden"></div>
+        <div class="actions single-column">
+          <a class="button-link secondary-link" href="./index.html">Ler outro QR</a>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js"></script>
+  <script async src="https://docs.opencv.org/4.10.0/opencv.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
