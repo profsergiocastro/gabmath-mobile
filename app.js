@@ -1,6 +1,8 @@
 const QR_PAYLOAD_PREFIX = "GABMATH1:";
 const STORAGE_KEY = "gabmath-current-proof";
 const RESULTS_STORAGE_KEY = "gabmath-exam-results-v1";
+const RESULTS_ACCESS_KEY = "gabmath-results-access-ok";
+const RESULTS_ACCESS_CODE = "166130";
 const CARD_TARGET = {
   width: 820,
   height: 1160,
@@ -61,6 +63,63 @@ const processingCanvas = document.createElement("canvas");
 
 document.addEventListener("DOMContentLoaded", initializeApp);
 
+function normalizeName(name) {
+  const trimmed = String(name || "").trim().replace(/\s+/g, " ");
+  if (!trimmed) {
+    return "";
+  }
+  try {
+    return trimmed
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "");
+  } catch {
+    return trimmed.toLowerCase();
+  }
+}
+
+function parseExamIdDate(examId) {
+  const raw = String(examId || "").trim();
+  const match = raw.match(/^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_/);
+  if (!match) {
+    return { iso: "", label: "" };
+  }
+  const [, yyyy, mm, dd, hh, mi, ss] = match;
+  const iso = `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}`;
+  const label = `${dd}/${mm}/${yyyy} às ${hh}h${mi}min${ss}s`;
+  return { iso, label };
+}
+
+function hasResultsAccess() {
+  try {
+    return sessionStorage.getItem(RESULTS_ACCESS_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function setResultsAccess(ok) {
+  try {
+    if (ok) {
+      sessionStorage.setItem(RESULTS_ACCESS_KEY, "1");
+    } else {
+      sessionStorage.removeItem(RESULTS_ACCESS_KEY);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function openResultsWithAccessCode() {
+  const typed = window.prompt("Digite o código de acesso:", "");
+  if (String(typed || "").trim() !== RESULTS_ACCESS_CODE) {
+    window.alert("Código inválido.");
+    return;
+  }
+  setResultsAccess(true);
+  window.location.href = "./resultados.html";
+}
+
 function initializeApp() {
   state.page = document.body.dataset.page || "qr";
   if (state.page === "qr") {
@@ -102,12 +161,16 @@ function initializeQrPage() {
     alignedCanvas: document.getElementById("aligned-preview"),
     backToQrButton: document.getElementById("back-to-qr"),
     debugToggle: document.getElementById("debug-toggle"),
+    openResultsButton: document.getElementById("open-results"),
   };
 
   state.elements.startScanButton.addEventListener("click", startQrCamera);
   state.elements.stopScanButton.addEventListener("click", stopWorkflow);
   state.elements.loadProofButton.addEventListener("click", () => commitQrAndGo(state.elements.proofIdInput.value));
   wireCardButtons();
+  if (state.elements.openResultsButton) {
+    state.elements.openResultsButton.addEventListener("click", openResultsWithAccessCode);
+  }
   if (state.elements.backToQrButton) {
     state.elements.backToQrButton.addEventListener("click", backToQrMode);
   }
@@ -182,9 +245,20 @@ function initializeCardPage() {
 }
 
 function initializeResultsPage() {
+  if (!hasResultsAccess()) {
+    const typed = window.prompt("Digite o código de acesso:", "");
+    if (String(typed || "").trim() !== RESULTS_ACCESS_CODE) {
+      window.alert("Código inválido.");
+      window.location.href = "./index.html";
+      return;
+    }
+    setResultsAccess(true);
+  }
+
   state.elements = {
     modeBadge: document.getElementById("mode-badge"),
     examSelect: document.getElementById("exam-select"),
+    examNameInput: document.getElementById("exam-name-input"),
     examSummary: document.getElementById("exam-summary"),
     resultsTbody: document.getElementById("results-tbody"),
     sortSelect: document.getElementById("sort-select"),
@@ -212,7 +286,11 @@ function initializeResultsPage() {
   const selectedExamId = selectedFromQuery && examIds.includes(selectedFromQuery) ? selectedFromQuery : examIds[0];
 
   state.elements.examSelect.innerHTML = examIds
-    .map((examId) => `<option value="${escapeHtml(examId)}"${examId === selectedExamId ? " selected" : ""}>${escapeHtml(examId)}</option>`)
+    .map((examId) => {
+      const exam = store.exams?.[examId];
+      const name = String(exam?.examName || examId);
+      return `<option value="${escapeHtml(examId)}"${examId === selectedExamId ? " selected" : ""}>${escapeHtml(name)}</option>`;
+    })
     .join("");
 
   state.elements.examSelect.addEventListener("change", () => {
@@ -226,6 +304,16 @@ function initializeResultsPage() {
   state.elements.exportQuestionsCsv.addEventListener("click", () => exportQuestionsCsv(state.elements.examSelect.value));
   state.elements.exportJson.addEventListener("click", () => exportExamJson(state.elements.examSelect.value));
   state.elements.closeStudentDialog.addEventListener("click", () => state.elements.studentDialog.close());
+  if (state.elements.examNameInput) {
+    state.elements.examNameInput.addEventListener("change", () => saveExamName(state.elements.examSelect.value));
+    state.elements.examNameInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        saveExamName(state.elements.examSelect.value);
+        state.elements.examNameInput.blur();
+      }
+    });
+  }
 
   renderResultsPage();
 }
@@ -253,6 +341,9 @@ function renderResultsPage() {
   const filtered = filterResultsByStudentName(results, state.elements.studentSearch.value);
   const sorted = sortResults(filtered, state.elements.sortSelect.value);
 
+  if (state.elements.examNameInput) {
+    state.elements.examNameInput.value = String(exam.examName || "");
+  }
   renderExamSummary(exam, results);
   renderResultsTable(examId, sorted);
   renderQuestionStats(exam, results);
@@ -332,9 +423,16 @@ function renderExamSummary(exam, results) {
   const max = totalStudents ? Math.max(...scores) : 0;
   const min = totalStudents ? Math.min(...scores) : 0;
   const stdev = calculateStandardDeviation(scores);
+  const parsed = parseExamIdDate(exam.examId);
+
+  const createdLine = parsed.label
+    ? `<div><strong>Data de elaboração:</strong> ${escapeHtml(parsed.label)}</div>`
+    : "";
 
   state.elements.examSummary.innerHTML = `
     <div><strong>Prova:</strong> ${escapeHtml(exam.examName || exam.examId || "")}</div>
+    <div><strong>ID:</strong> ${escapeHtml(exam.examId || "")}</div>
+    ${createdLine}
     <div><strong>Alunos corrigidos:</strong> ${totalStudents}</div>
     <div><strong>Média:</strong> ${mean.toFixed(2)}</div>
     <div><strong>Mediana:</strong> ${median.toFixed(2)}</div>
@@ -366,8 +464,8 @@ function renderResultsTable(examId, results) {
         <td><span class="pill ${pillClass}">${percent.toFixed(2)}%</span></td>
         <td>${escapeHtml(formatDateTime(item.correctedAt))}</td>
         <td class="actions-cell">
-          <button data-action="details" data-student="${escapeHtml(item.studentName || "")}">Detalhes</button>
-          <button class="secondary" data-action="delete" data-student="${escapeHtml(item.studentName || "")}">Excluir</button>
+          <button data-action="details" data-student="${escapeHtml(item.studentId || "")}">Detalhes</button>
+          <button class="secondary" data-action="delete" data-student="${escapeHtml(item.studentId || "")}">Excluir</button>
         </td>
       </tr>
     `;
@@ -388,10 +486,10 @@ function renderResultsTable(examId, results) {
   }
 }
 
-function openStudentDetails(examId, studentName) {
+function openStudentDetails(examId, studentId) {
   const store = loadResultsStore();
   const exam = store.exams?.[examId];
-  const row = (exam?.results || []).find((item) => String(item.studentName || "") === String(studentName || ""));
+  const row = (exam?.results || []).find((item) => String(item.studentId || "") === String(studentId || ""));
   if (!row) {
     return;
   }
@@ -424,9 +522,30 @@ function openStudentDetails(examId, studentName) {
   state.elements.studentDialog.showModal();
 }
 
-function deleteStudentResult(examId, studentName) {
-  const confirmed = window.confirm(`Excluir o resultado de ${studentName}?`);
+function deleteStudentResult(examId, studentId) {
+  const store = loadResultsStore();
+  const exam = store.exams?.[examId];
+  const row = (exam?.results || []).find((item) => String(item.studentId || "") === String(studentId || ""));
+  if (!row) {
+    return;
+  }
+
+  const confirmed = window.confirm(`Excluir o resultado de ${row.studentName}?`);
   if (!confirmed) {
+    return;
+  }
+
+  exam.results = (exam.results || []).filter((item) => String(item.studentId || "") !== String(studentId || ""));
+  saveResultsStore(store);
+  renderResultsPage();
+}
+
+function saveExamName(examId) {
+  if (!examId) {
+    return;
+  }
+  const nextName = String(state.elements.examNameInput?.value || "").trim();
+  if (!nextName) {
     return;
   }
   const store = loadResultsStore();
@@ -434,9 +553,18 @@ function deleteStudentResult(examId, studentName) {
   if (!exam) {
     return;
   }
-  exam.results = (exam.results || []).filter((item) => String(item.studentName || "") !== String(studentName || ""));
+  exam.examName = nextName;
   saveResultsStore(store);
-  renderResultsPage();
+
+  try {
+    const selector = `option[value="${CSS.escape(examId)}"]`;
+    const option = state.elements.examSelect?.querySelector(selector);
+    if (option) {
+      option.textContent = nextName;
+    }
+  } catch {
+    // ignore
+  }
 }
 
 function calculateQuestionStats(exam, results) {
@@ -2401,6 +2529,17 @@ function confirmReading() {
     return;
   }
 
+  // Garante que o nome do aluno exista (para não sobrescrever como "Aluno").
+  if (!String(state.proof.aluno || "").trim()) {
+    const typed = window.prompt("Informe o nome do aluno:", "");
+    if (!typed || !String(typed).trim()) {
+      setStatus("Informe o nome do aluno para salvar o resultado.");
+      return;
+    }
+    state.proof.aluno = String(typed).trim();
+    renderProofSummary();
+  }
+
   try {
     saveStudentResult({
       proof: state.proof,
@@ -2411,8 +2550,7 @@ function confirmReading() {
     return;
   }
 
-  const examId = String(state.proof.id_prova || "").trim() || "prova";
-  window.location.href = `./resultados.html?examId=${encodeURIComponent(examId)}`;
+  setStatus("Resultado salvo com sucesso.");
 }
 
 function cancelReading() {
@@ -2426,23 +2564,96 @@ function loadResultsStore() {
   try {
     const raw = localStorage.getItem(RESULTS_STORAGE_KEY);
     if (!raw) {
-      return { exams: {} };
+      return { version: 2, exams: {} };
     }
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") {
-      return { exams: {} };
-    }
-    if (!parsed.exams || typeof parsed.exams !== "object") {
-      return { exams: {} };
-    }
-    return parsed;
+    return migrateResultsStore(parsed);
   } catch {
-    return { exams: {} };
+    return { version: 2, exams: {} };
   }
 }
 
 function saveResultsStore(store) {
   localStorage.setItem(RESULTS_STORAGE_KEY, JSON.stringify(store));
+}
+
+function migrateResultsStore(parsed) {
+  const empty = { version: 2, exams: {} };
+  if (!parsed || typeof parsed !== "object") {
+    return empty;
+  }
+
+  // Formato atual: { exams: { [examId]: exam } }
+  if (parsed.exams && typeof parsed.exams === "object") {
+    const next = { version: Number(parsed.version) || 2, exams: {} };
+    for (const [examId, exam] of Object.entries(parsed.exams)) {
+      if (!exam || typeof exam !== "object") {
+        continue;
+      }
+      const parsedDate = parseExamIdDate(examId);
+      const normalized = {
+        examId,
+        examName: String(exam.examName || examId),
+        createdAtFromId: String(exam.createdAtFromId || parsedDate.iso || ""),
+        answerKey: exam.answerKey && typeof exam.answerKey === "object" ? exam.answerKey : {},
+        questionIds: Array.isArray(exam.questionIds) ? exam.questionIds : [],
+        results: Array.isArray(exam.results) ? exam.results : [],
+        annulled: exam.annulled && typeof exam.annulled === "object" ? exam.annulled : {},
+      };
+      normalized.results = normalized.results.map((row) => ({
+        ...row,
+        studentId: String(row.studentId || normalizeName(row.studentName || "")),
+      }));
+      next.exams[examId] = normalized;
+    }
+    return next;
+  }
+
+  // Migração: exame salvo diretamente.
+  if (typeof parsed.examId === "string") {
+    const examId = parsed.examId;
+    const parsedDate = parseExamIdDate(examId);
+    const exam = {
+      examId,
+      examName: String(parsed.examName || examId),
+      createdAtFromId: String(parsed.createdAtFromId || parsedDate.iso || ""),
+      answerKey: parsed.answerKey && typeof parsed.answerKey === "object" ? parsed.answerKey : {},
+      questionIds: Array.isArray(parsed.questionIds) ? parsed.questionIds : [],
+      results: Array.isArray(parsed.results) ? parsed.results : [],
+      annulled: parsed.annulled && typeof parsed.annulled === "object" ? parsed.annulled : {},
+    };
+    exam.results = exam.results.map((row) => ({
+      ...row,
+      studentId: String(row.studentId || normalizeName(row.studentName || "")),
+    }));
+    return { version: 2, exams: { [examId]: exam } };
+  }
+
+  // Migração: um único resultado.
+  if (parsed.studentName && parsed.examId) {
+    const examId = String(parsed.examId);
+    const parsedDate = parseExamIdDate(examId);
+    const row = {
+      ...parsed,
+      studentId: String(parsed.studentId || normalizeName(parsed.studentName || "")),
+    };
+    return {
+      version: 2,
+      exams: {
+        [examId]: {
+          examId,
+          examName: String(parsed.examName || examId),
+          createdAtFromId: String(parsed.createdAtFromId || parsedDate.iso || ""),
+          answerKey: parsed.answerKey && typeof parsed.answerKey === "object" ? parsed.answerKey : {},
+          questionIds: Array.isArray(parsed.questionIds) ? parsed.questionIds : [],
+          results: [row],
+          annulled: {},
+        },
+      },
+    };
+  }
+
+  return empty;
 }
 
 function questionIdForNumber(number) {
@@ -2455,8 +2666,12 @@ function toIsoNow() {
 
 function saveStudentResult({ proof, result }) {
   const examId = String(proof.id_prova || "").trim() || "prova";
-  const examName = String(proof.id_prova || "").trim() || "Prova";
-  const studentName = String(proof.aluno || "").trim() || "Aluno";
+  const examName = String(proof.nome_prova || proof.id_prova || "").trim() || examId;
+  const studentName = String(proof.aluno || "").trim();
+  if (!studentName) {
+    throw new Error("Informe o nome do aluno para salvar o resultado.");
+  }
+  const studentId = String(proof.id_aluno || proof.studentId || "").trim() || normalizeName(studentName);
 
   const answerKey = {};
   const questionIds = [];
@@ -2493,9 +2708,11 @@ function saveStudentResult({ proof, result }) {
 
   const store = loadResultsStore();
   store.exams ||= {};
+  const parsedDate = parseExamIdDate(examId);
   store.exams[examId] ||= {
     examId,
     examName,
+    createdAtFromId: parsedDate.iso || "",
     answerKey,
     questionIds,
     results: [],
@@ -2506,6 +2723,10 @@ function saveStudentResult({ proof, result }) {
   store.exams[examId].answerKey = answerKey;
   store.exams[examId].questionIds = questionIds;
   store.exams[examId].examName = store.exams[examId].examName || examName;
+  store.exams[examId].createdAtFromId = store.exams[examId].createdAtFromId || parsedDate.iso || "";
+  if (!Array.isArray(store.exams[examId].results)) {
+    store.exams[examId].results = [];
+  }
 
   const correctedAt = toIsoNow();
   const total = Number(result.total || 0);
@@ -2514,6 +2735,7 @@ function saveStudentResult({ proof, result }) {
   const percentage = total ? Math.round((correctCount / total) * 10000) / 100 : 0;
 
   const row = {
+    studentId,
     studentName,
     examId,
     correctedAt,
@@ -2530,8 +2752,9 @@ function saveStudentResult({ proof, result }) {
     questionMeta,
   };
 
+  const beforeCount = (store.exams[examId].results || []).length;
   const existingIndex = (store.exams[examId].results || []).findIndex(
-    (item) => String(item.studentName || "").trim().toLowerCase() === studentName.toLowerCase()
+    (item) => String(item.studentId || "") === String(studentId || "")
   );
   if (existingIndex >= 0) {
     const replace = window.confirm(
@@ -2545,6 +2768,16 @@ function saveStudentResult({ proof, result }) {
     store.exams[examId].results.push(row);
   }
 
+  console.log(
+    "[Resultados] examId:",
+    examId,
+    "| antes:",
+    beforeCount,
+    "| depois:",
+    (store.exams[examId].results || []).length,
+    "| aluno:",
+    studentName,
+  );
   saveResultsStore(store);
 }
 
@@ -2621,6 +2854,7 @@ function parseQrPayload(rawValue) {
   return {
     id_prova: payload.i || payload.id || "",
     aluno: payload.s || payload.a || "",
+    studentId: payload.sid || payload.studentId || payload.matricula || payload.m || "",
     quantidade_questoes: questions.length,
     questoes: questions,
   };
