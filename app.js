@@ -39,6 +39,10 @@ const state = {
   cardMode: false,
   autoStartCardReading: false,
   debug: false,
+  workflow: "idle",
+  qrProcessing: false,
+  lastQrValue: "",
+  lastQrAt: 0,
   elements: {},
   page: "",
 };
@@ -86,13 +90,17 @@ function initializeQrPage() {
   state.elements.stopScanButton.addEventListener("click", stopWorkflow);
   state.elements.loadProofButton.addEventListener("click", () => commitQrAndGo(state.elements.proofIdInput.value));
   if (state.elements.startCardScanButton) {
-    state.elements.startCardScanButton.addEventListener("click", startCardReading);
+    state.elements.startCardScanButton.addEventListener("click", startAnswerScan);
   }
   if (state.elements.backToQrButton) {
     state.elements.backToQrButton.addEventListener("click", backToQrMode);
   }
   if (state.elements.stopCardButton) {
-    state.elements.stopCardButton.addEventListener("click", stopWorkflow);
+    state.elements.stopCardButton.addEventListener("click", () => {
+      stopAnswerCamera();
+      setWorkflowState("waitingUserToStartAnswerScan", "Leitura interrompida. Alinhe e toque em “Iniciar leitura”.");
+      updateCardControls();
+    });
   }
 
   waitForOpenCv();
@@ -133,9 +141,9 @@ function initializeCardPage() {
     debugToggle: document.getElementById("debug-toggle"),
   };
 
-  state.elements.startScanButton.addEventListener("click", startCardCamera);
+  state.elements.startScanButton.addEventListener("click", startAnswerScan);
   state.elements.stopScanButton.addEventListener("click", stopWorkflow);
-  state.elements.startCardScanButton.addEventListener("click", startCardReading);
+  state.elements.startCardScanButton.addEventListener("click", startAnswerScan);
 
   waitForOpenCv();
   state.debug = Boolean(getQueryFlag("debug")) || Boolean(state.elements.debugToggle?.checked);
@@ -158,14 +166,24 @@ function initializeCardPage() {
 }
 
 async function startQrCamera() {
+  setWorkflowState("qrScanning", "Abrindo câmera…");
   await startCamera();
-  setStatus("Camera aberta. Aponte apenas para o QR Code.");
+  if (!state.stream) {
+    setWorkflowState("error", "Falha ao abrir a câmera.");
+    return;
+  }
+  setStatus("Câmera aberta. Aponte apenas para o QR Code.");
   startQrLoop();
 }
 
 async function startCardCamera() {
   await startCamera();
-  setStatus("Camera aberta. Posicione o cartao com calma antes de iniciar a leitura.");
+  if (!state.stream) {
+    setWorkflowState("error", "Falha ao abrir a câmera.");
+    return;
+  }
+  setWorkflowState("waitingUserToStartAnswerScan", "Câmera aberta. Alinhe o cartão e toque em “Iniciar leitura”.");
+  updateCardControls();
 }
 
 async function startCamera() {
@@ -176,6 +194,7 @@ async function startCamera() {
 
   stopLoops();
   clearOverlay();
+  disposeCameraResources();
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -189,24 +208,70 @@ async function startCamera() {
     state.stream = stream;
     state.elements.video.srcObject = stream;
     await state.elements.video.play();
+
+    // Tenta habilitar foco contínuo (quando suportado).
+    try {
+      const track = stream.getVideoTracks?.()[0];
+      if (track?.applyConstraints) {
+        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+      }
+    } catch {
+      // ignore
+    }
   } catch (error) {
     setStatus(`Falha ao abrir a camera: ${error?.message || String(error)}`);
   }
 }
 
 function stopWorkflow() {
+  if (state.workflow === "qrScanning") {
+    stopQrCamera();
+    setWorkflowState("idle", "Leitura do QR interrompida.");
+    return;
+  }
+  if (state.workflow === "answerScanning") {
+    stopAnswerCamera();
+    setWorkflowState("waitingUserToStartAnswerScan", "Leitura do cartão interrompida.");
+    return;
+  }
+  disposeCameraResources();
   stopLoops();
+  clearOverlay();
+  setWorkflowState("idle", "Leitura interrompida.");
+}
+
+function disposeCameraResources() {
   if (state.stream) {
     for (const track of state.stream.getTracks()) {
-      track.stop();
+      try {
+        track.stop();
+      } catch {
+        // ignore
+      }
     }
     state.stream = null;
   }
   if (state.elements.video) {
+    try {
+      state.elements.video.pause?.();
+    } catch {
+      // ignore
+    }
     state.elements.video.srcObject = null;
   }
+}
+
+function stopQrCamera() {
+  stopLoops();
+  state.qrProcessing = false;
+  disposeCameraResources();
   clearOverlay();
-  setStatus("Leitura interrompida.");
+}
+
+function stopAnswerCamera() {
+  stopLoops();
+  disposeCameraResources();
+  clearOverlay();
 }
 
 function stopLoops() {
@@ -223,8 +288,13 @@ function stopLoops() {
 
 function startQrLoop() {
   stopLoops();
+  state.qrProcessing = false;
   state.qrTimer = setInterval(async () => {
     if (!state.elements.video?.srcObject) {
+      return;
+    }
+    drawQrGuide();
+    if (state.qrProcessing) {
       return;
     }
     try {
@@ -232,10 +302,18 @@ function startQrLoop() {
       if (!rawValue) {
         return;
       }
+      const now = Date.now();
+      if (rawValue === state.lastQrValue && (now - state.lastQrAt) < 2000) {
+        return;
+      }
+      state.lastQrValue = rawValue;
+      state.lastQrAt = now;
+      state.qrProcessing = true;
       state.elements.proofIdInput.value = rawValue;
       commitQrAndGo(rawValue);
     } catch (error) {
       setStatus(`Falha na leitura do QR: ${error?.message || String(error)}`);
+      state.qrProcessing = false;
     }
   }, 450);
 }
@@ -249,8 +327,8 @@ function enterCardMode(proof, { autoStart } = { autoStart: false }) {
   state.lastDetection = null;
   state.autoStartCardReading = Boolean(autoStart);
 
-  stopLoops(); // para loop de QR, mas mantem stream aberta
-  clearOverlay();
+  // Ao sair do QR, sempre libera a câmera e espera o usuário iniciar.
+  stopQrCamera();
 
   if (state.elements.qrStep) {
     state.elements.qrStep.classList.add("hidden");
@@ -265,30 +343,23 @@ function enterCardMode(proof, { autoStart } = { autoStart: false }) {
 
   renderProofSummary();
   renderAnswerGrid();
-  setBadge("Lendo cartao");
+  setWorkflowState("waitingUserToStartAnswerScan");
+  setBadge("Cartão-resposta");
+  updateCardControls();
 
   if (!state.opencvReady) {
     setStatus("Carregando OpenCV... aguarde alguns segundos.");
     return;
   }
-  if (!state.stream) {
-    setStatus("Camera nao esta aberta. Toque em 'Iniciar camera' e leia o QR novamente.");
-    state.autoStartCardReading = false;
-    return;
-  }
 
-  setStatus("Alinhe o cartao e os 4 quadrados pretos. Quando estiver nitido, a leitura fecha automaticamente.");
-  if (state.autoStartCardReading) {
-    // Usa o mesmo stream do QR; nao pede permissao de novo.
-    startCardReading();
-  }
+  setStatus("Alinhe o celular com o cartão-resposta e toque em “Iniciar leitura”.");
 }
 
 function backToQrMode() {
   state.cardMode = false;
   state.autoStartCardReading = false;
   stopLoops();
-  clearOverlay();
+  stopAnswerCamera();
   state.proof = null;
   state.answers = {};
   state.stableSignature = "";
@@ -303,7 +374,7 @@ function backToQrMode() {
     state.elements.qrStep.classList.remove("hidden");
   }
   setBadge("Lendo QR");
-  setStatus("Aponte a camera apenas para o QR Code.");
+  setWorkflowState("idle", "Aponte a câmera apenas para o QR Code.");
 }
 
 async function detectQrCode(videoElement) {
@@ -316,10 +387,36 @@ async function detectQrCode(videoElement) {
   }
 
   if (typeof window.jsQR === "function") {
-    captureCanvas.width = videoElement.videoWidth;
-    captureCanvas.height = videoElement.videoHeight;
+    const videoWidth = videoElement.videoWidth || 0;
+    const videoHeight = videoElement.videoHeight || 0;
+    if (videoWidth < 40 || videoHeight < 40) {
+      return "";
+    }
+
+    // Processa apenas a área central (melhora performance e reduz falso positivo).
+    const cropScale = 0.68;
+    const cropWidth = Math.round(videoWidth * cropScale);
+    const cropHeight = Math.round(videoHeight * cropScale);
+    const cropX = Math.round((videoWidth - cropWidth) / 2);
+    const cropY = Math.round((videoHeight - cropHeight) / 2);
+
+    // Downscale para acelerar (jsQR é CPU-bound).
+    const maxSide = 720;
+    const scale = Math.min(1, maxSide / Math.max(cropWidth, cropHeight, 1));
+    captureCanvas.width = Math.max(1, Math.round(cropWidth * scale));
+    captureCanvas.height = Math.max(1, Math.round(cropHeight * scale));
     const context = captureCanvas.getContext("2d", { willReadFrequently: true });
-    context.drawImage(videoElement, 0, 0, captureCanvas.width, captureCanvas.height);
+    context.drawImage(
+      videoElement,
+      cropX,
+      cropY,
+      cropWidth,
+      cropHeight,
+      0,
+      0,
+      captureCanvas.width,
+      captureCanvas.height,
+    );
     const imageData = context.getImageData(0, 0, captureCanvas.width, captureCanvas.height);
     const code = window.jsQR(imageData.data, imageData.width, imageData.height, {
       inversionAttempts: "attemptBoth",
@@ -330,6 +427,34 @@ async function detectQrCode(videoElement) {
   }
 
   return "";
+}
+
+function drawQrGuide() {
+  if (!state.elements?.overlayCanvas || !state.elements?.video) {
+    return;
+  }
+  const width = state.elements.video.clientWidth || state.elements.video.videoWidth || 1;
+  const height = state.elements.video.clientHeight || state.elements.video.videoHeight || 1;
+  state.elements.overlayCanvas.width = width;
+  state.elements.overlayCanvas.height = height;
+  const context = state.elements.overlayCanvas.getContext("2d");
+  context.clearRect(0, 0, width, height);
+
+  const boxW = Math.round(width * 0.62);
+  const boxH = Math.round(height * 0.62);
+  const x = Math.round((width - boxW) / 2);
+  const y = Math.round((height - boxH) / 2);
+
+  context.strokeStyle = "rgba(255,255,255,0.85)";
+  context.lineWidth = 3;
+  context.setLineDash([10, 8]);
+  context.strokeRect(x, y, boxW, boxH);
+  context.setLineDash([]);
+  context.fillStyle = "rgba(0,0,0,0.15)";
+  context.fillRect(0, 0, width, y);
+  context.fillRect(0, y + boxH, width, height - (y + boxH));
+  context.fillRect(0, y, x, boxH);
+  context.fillRect(x + boxW, y, width - (x + boxW), boxH);
 }
 
 function commitQrAndGo(rawValue) {
@@ -343,12 +468,14 @@ function commitQrAndGo(rawValue) {
     const proof = parseQrPayload(normalized);
     sessionStorage.setItem(STORAGE_KEY, JSON.stringify(proof));
     if (state.elements.cardStep) {
-      enterCardMode(proof, { autoStart: true });
+      enterCardMode(proof, { autoStart: false });
     } else {
       window.location.href = "./card.html";
     }
+    state.qrProcessing = false;
   } catch (error) {
     setStatus(error?.message || String(error));
+    state.qrProcessing = false;
   }
 }
 
@@ -374,10 +501,7 @@ function waitForOpenCv() {
 }
 
 function onOpenCvReady() {
-  if (state.cardMode && state.autoStartCardReading && state.stream) {
-    state.autoStartCardReading = false;
-    startCardReading();
-  }
+  updateCardControls();
 }
 
 function renderProofSummary() {
@@ -431,7 +555,7 @@ function startCardReading() {
     return;
   }
   if (!state.stream || !state.elements.video?.srcObject) {
-    setStatus("Abra a camera antes de iniciar a leitura do cartao.");
+    setStatus("Abra a câmera antes de iniciar a leitura do cartão.");
     return;
   }
   if (!state.opencvReady) {
@@ -439,6 +563,8 @@ function startCardReading() {
     return;
   }
 
+  setWorkflowState("answerScanning");
+  updateCardControls();
   state.answers = {};
   state.stableSignature = "";
   state.stableCount = 0;
@@ -448,7 +574,7 @@ function startCardReading() {
   clearOverlay();
   stopLoops();
 
-  setStatus("Alinhe os 4 quadrados pretos. A leitura so fecha quando a imagem estiver nitida.");
+  setStatus("Alinhe os 4 quadrados pretos. A leitura só fecha quando a imagem estiver nítida.");
 
   let lastTimestamp = 0;
   const tick = (timestamp) => {
@@ -497,8 +623,10 @@ function startCardReading() {
     setStatus(`Cartao alinhado e nitido. Confirmando leitura... ${state.stableCount}/${REQUIRED_STABLE_FRAMES}`);
 
     if (state.stableCount >= REQUIRED_STABLE_FRAMES) {
-      stopLoops();
+      stopAnswerCamera();
       correctProof();
+      setWorkflowState("answerDetected");
+      updateCardControls();
       return;
     }
 
@@ -1310,6 +1438,67 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function setWorkflowState(next, statusText) {
+  state.workflow = next;
+  if (statusText) {
+    setStatus(statusText);
+  }
+  if (!state.elements?.modeBadge) {
+    return;
+  }
+  const badgeText = {
+    idle: "Aguardando",
+    qrScanning: "Lendo QR",
+    qrDetected: "QR detectado",
+    waitingUserToStartAnswerScan: "Aguardando leitura",
+    answerScanning: "Lendo cartão",
+    answerDetected: "Leitura concluída",
+    error: "Erro",
+  }[next] || next;
+  setBadge(badgeText);
+}
+
+function updateCardControls() {
+  if (!state.elements?.startCardScanButton) {
+    return;
+  }
+  const button = state.elements.startCardScanButton;
+  if (!state.cardMode) {
+    return;
+  }
+
+  if (state.workflow === "answerScanning") {
+    button.disabled = true;
+    button.textContent = "Lendo…";
+    return;
+  }
+
+  button.disabled = !state.opencvReady || !state.proof;
+  if (!state.opencvReady) {
+    button.textContent = "Aguarde o OpenCV…";
+    return;
+  }
+  button.textContent = state.stream ? "Iniciar leitura" : "Habilitar câmera";
+}
+
+async function startAnswerScan() {
+  if (!state.proof) {
+    setStatus("Nenhuma prova carregada.");
+    return;
+  }
+  if (!state.opencvReady) {
+    setStatus("OpenCV ainda está carregando.");
+    return;
+  }
+
+  if (!state.stream) {
+    await startCardCamera();
+    return;
+  }
+
+  startCardReading();
 }
 
 function getQueryFlag(name) {
