@@ -157,6 +157,19 @@ button.full {
   background: #fff;
 }
 
+.debug-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin-top: 12px;
+  color: #17324d;
+}
+
+.debug-toggle input {
+  width: 1.05rem;
+  height: 1.05rem;
+}
+
 .summary {
   display: grid;
   gap: 6px;

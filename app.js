@@ -12,12 +12,18 @@ const CARD_PROCESSING_MAX_WIDTH = 960;
 const CARD_FRAME_INTERVAL_MS = 140;
 const MIN_FOCUS_SCORE = 120;
 const REQUIRED_STABLE_FRAMES = 4;
-const MIN_CARD_RECTANGLE_SCORE = 0.18;
-const MIN_MARKER_FILL_RATIO = 0.72;
+const MIN_CARD_RECTANGLE_SCORE = 0.12;
+const MIN_MARKER_FILL_RATIO = 0.62;
 const MIN_MARKER_SIDE = 16;
 const MAX_MARKER_SIDE = 90;
 const MIN_FILLED_BUBBLE_SCORE = 0.24;
 const SECOND_BUBBLE_RELATIVE_LIMIT = 0.86;
+
+// Leitura v2 (mais robusta para bolhas circulares, com limiar adaptativo).
+const BUBBLE_CONTRAST_MIN = 0.085;
+const BUBBLE_AMBIGUOUS_RELATIVE = 0.9;
+const BUBBLE_AMBIGUOUS_GAP = 0.035;
+const MARKER_CORNER_BONUS = 0.6;
 
 const state = {
   stream: null,
@@ -30,6 +36,9 @@ const state = {
   stableSignature: "",
   stableCount: 0,
   lastDetection: null,
+  cardMode: false,
+  autoStartCardReading: false,
+  debug: false,
   elements: {},
   page: "",
 };
@@ -52,6 +61,7 @@ function initializeApp() {
 
 function initializeQrPage() {
   state.elements = {
+    modeBadge: document.getElementById("mode-badge"),
     video: document.getElementById("camera-video"),
     overlayCanvas: document.getElementById("camera-overlay"),
     startScanButton: document.getElementById("start-scan"),
@@ -59,17 +69,57 @@ function initializeQrPage() {
     loadProofButton: document.getElementById("load-proof"),
     proofIdInput: document.getElementById("proof-id-input"),
     scanStatus: document.getElementById("scan-status"),
+    cardStatus: document.getElementById("card-status"),
+    qrStep: document.getElementById("step-qr"),
+    cardStep: document.getElementById("step-card"),
+    startCardScanButton: document.getElementById("start-card-scan"),
+    proofSummary: document.getElementById("proof-summary"),
+    answerGrid: document.getElementById("answer-grid"),
+    resultPanel: document.getElementById("result-panel"),
+    alignedCanvas: document.getElementById("aligned-preview"),
+    backToQrButton: document.getElementById("back-to-qr"),
+    stopCardButton: document.getElementById("stop-card"),
+    debugToggle: document.getElementById("debug-toggle"),
   };
 
   state.elements.startScanButton.addEventListener("click", startQrCamera);
   state.elements.stopScanButton.addEventListener("click", stopWorkflow);
   state.elements.loadProofButton.addEventListener("click", () => commitQrAndGo(state.elements.proofIdInput.value));
+  if (state.elements.startCardScanButton) {
+    state.elements.startCardScanButton.addEventListener("click", startCardReading);
+  }
+  if (state.elements.backToQrButton) {
+    state.elements.backToQrButton.addEventListener("click", backToQrMode);
+  }
+  if (state.elements.stopCardButton) {
+    state.elements.stopCardButton.addEventListener("click", stopWorkflow);
+  }
 
+  waitForOpenCv();
   setStatus("Aponte a camera apenas para o QR Code.");
+  state.debug = Boolean(getQueryFlag("debug")) || Boolean(state.elements.debugToggle?.checked);
+  if (state.elements.debugToggle) {
+    state.elements.debugToggle.addEventListener("change", () => {
+      state.debug = Boolean(state.elements.debugToggle.checked);
+    });
+  }
+
+  const stored = sessionStorage.getItem(STORAGE_KEY);
+  if (stored) {
+    try {
+      const proof = JSON.parse(stored);
+      if (proof && state.elements.cardStep) {
+        enterCardMode(proof, { autoStart: false });
+      }
+    } catch {
+      // ignore
+    }
+  }
 }
 
 function initializeCardPage() {
   state.elements = {
+    modeBadge: document.getElementById("mode-badge"),
     video: document.getElementById("camera-video"),
     overlayCanvas: document.getElementById("camera-overlay"),
     alignedCanvas: document.getElementById("aligned-preview"),
@@ -80,6 +130,7 @@ function initializeCardPage() {
     scanStatus: document.getElementById("scan-status"),
     answerGrid: document.getElementById("answer-grid"),
     resultPanel: document.getElementById("result-panel"),
+    debugToggle: document.getElementById("debug-toggle"),
   };
 
   state.elements.startScanButton.addEventListener("click", startCardCamera);
@@ -87,6 +138,12 @@ function initializeCardPage() {
   state.elements.startCardScanButton.addEventListener("click", startCardReading);
 
   waitForOpenCv();
+  state.debug = Boolean(getQueryFlag("debug")) || Boolean(state.elements.debugToggle?.checked);
+  if (state.elements.debugToggle) {
+    state.elements.debugToggle.addEventListener("change", () => {
+      state.debug = Boolean(state.elements.debugToggle.checked);
+    });
+  }
   const stored = sessionStorage.getItem(STORAGE_KEY);
   if (!stored) {
     setStatus("Nenhuma prova foi carregada. Volte e leia o QR Code primeiro.");
@@ -183,6 +240,72 @@ function startQrLoop() {
   }, 450);
 }
 
+function enterCardMode(proof, { autoStart } = { autoStart: false }) {
+  state.cardMode = true;
+  state.proof = proof;
+  state.answers = {};
+  state.stableSignature = "";
+  state.stableCount = 0;
+  state.lastDetection = null;
+  state.autoStartCardReading = Boolean(autoStart);
+
+  stopLoops(); // para loop de QR, mas mantem stream aberta
+  clearOverlay();
+
+  if (state.elements.qrStep) {
+    state.elements.qrStep.classList.add("hidden");
+  }
+  if (state.elements.cardStep) {
+    state.elements.cardStep.classList.remove("hidden");
+  }
+  if (state.elements.resultPanel) {
+    state.elements.resultPanel.classList.add("hidden");
+    state.elements.resultPanel.innerHTML = "";
+  }
+
+  renderProofSummary();
+  renderAnswerGrid();
+  setBadge("Lendo cartao");
+
+  if (!state.opencvReady) {
+    setStatus("Carregando OpenCV... aguarde alguns segundos.");
+    return;
+  }
+  if (!state.stream) {
+    setStatus("Camera nao esta aberta. Toque em 'Iniciar camera' e leia o QR novamente.");
+    state.autoStartCardReading = false;
+    return;
+  }
+
+  setStatus("Alinhe o cartao e os 4 quadrados pretos. Quando estiver nitido, a leitura fecha automaticamente.");
+  if (state.autoStartCardReading) {
+    // Usa o mesmo stream do QR; nao pede permissao de novo.
+    startCardReading();
+  }
+}
+
+function backToQrMode() {
+  state.cardMode = false;
+  state.autoStartCardReading = false;
+  stopLoops();
+  clearOverlay();
+  state.proof = null;
+  state.answers = {};
+  state.stableSignature = "";
+  state.stableCount = 0;
+  state.lastDetection = null;
+  sessionStorage.removeItem(STORAGE_KEY);
+
+  if (state.elements.cardStep) {
+    state.elements.cardStep.classList.add("hidden");
+  }
+  if (state.elements.qrStep) {
+    state.elements.qrStep.classList.remove("hidden");
+  }
+  setBadge("Lendo QR");
+  setStatus("Aponte a camera apenas para o QR Code.");
+}
+
 async function detectQrCode(videoElement) {
   if ("BarcodeDetector" in window) {
     const detector = new BarcodeDetector({ formats: ["qr_code"] });
@@ -219,7 +342,11 @@ function commitQrAndGo(rawValue) {
   try {
     const proof = parseQrPayload(normalized);
     sessionStorage.setItem(STORAGE_KEY, JSON.stringify(proof));
-    window.location.href = "./card.html";
+    if (state.elements.cardStep) {
+      enterCardMode(proof, { autoStart: true });
+    } else {
+      window.location.href = "./card.html";
+    }
   } catch (error) {
     setStatus(error?.message || String(error));
   }
@@ -229,6 +356,7 @@ function waitForOpenCv() {
   if (window.cv && typeof window.cv.Mat === "function") {
     state.opencvReady = true;
     state.opencvKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+    onOpenCvReady();
     return;
   }
 
@@ -240,8 +368,16 @@ function waitForOpenCv() {
       if (state.page === "card") {
         setStatus("OpenCV carregado. Agora voce pode iniciar a leitura do cartao.");
       }
+      onOpenCvReady();
     }
   }, 250);
+}
+
+function onOpenCvReady() {
+  if (state.cardMode && state.autoStartCardReading && state.stream) {
+    state.autoStartCardReading = false;
+    startCardReading();
+  }
 }
 
 function renderProofSummary() {
@@ -387,21 +523,42 @@ function detectCardAnswers(videoElement, questionCount) {
   const gray = new cv.Mat();
   const blur = new cv.Mat();
   const thresh = new cv.Mat();
-  const contours = new cv.MatVector();
-  const hierarchy = new cv.Mat();
 
   try {
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.equalizeHist(gray, gray);
     cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
     cv.threshold(blur, thresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
     if (state.opencvKernel) {
       cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
     }
-    cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-    const markers = collectMarkerCandidates(contours, processingCanvas.width, processingCanvas.height);
+    let markers = findMarkersV2(thresh, processingCanvas.width, processingCanvas.height);
     if (markers.length < 4) {
-      return null;
+      // Fallback para o algoritmo anterior.
+      markers = findMarkers(thresh, processingCanvas.width, processingCanvas.height);
+    }
+
+    if (markers.length < 4) {
+      // Fallback: adaptativo costuma funcionar melhor com sombras/reflexo.
+      cv.adaptiveThreshold(
+        blur,
+        thresh,
+        255,
+        cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv.THRESH_BINARY_INV,
+        31,
+        7,
+      );
+      if (state.opencvKernel) {
+        cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
+      }
+      markers = findMarkersV2(thresh, processingCanvas.width, processingCanvas.height);
+      if (markers.length < 4) {
+        markers = findMarkers(thresh, processingCanvas.width, processingCanvas.height);
+      }
+      if (markers.length < 4) {
+        return null;
+      }
     }
 
     const corners = orderCorners(markers.slice(0, 4).map((marker) => marker.center));
@@ -413,11 +570,20 @@ function detectCardAnswers(videoElement, questionCount) {
     const basePreview = new cv.Mat();
     cv.cvtColor(warped, basePreview, cv.COLOR_GRAY2RGBA);
 
-    const reading = readAnswersFromWarped(warped, questionCount);
+    let reading;
+    try {
+      reading = readAnswersFromWarpedV2(warped, questionCount);
+    } catch {
+      reading = readAnswersFromWarped(warped, questionCount);
+    }
     const baseImageData = matToImageData(basePreview);
 
     warped.delete();
     basePreview.delete();
+
+    if (state.debug) {
+      drawGridOverlay(baseImageData, reading.rows);
+    }
 
     return {
       corners,
@@ -431,6 +597,28 @@ function detectCardAnswers(videoElement, questionCount) {
     gray.delete();
     blur.delete();
     thresh.delete();
+  }
+}
+
+function findMarkers(binaryMat, width, height) {
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  try {
+    cv.findContours(binaryMat, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    return collectMarkerCandidates(contours, width, height);
+  } finally {
+    contours.delete();
+    hierarchy.delete();
+  }
+}
+
+function findMarkersV2(binaryMat, width, height) {
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  try {
+    cv.findContours(binaryMat, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    return collectMarkerCandidatesV2(contours, width, height);
+  } finally {
     contours.delete();
     hierarchy.delete();
   }
@@ -439,6 +627,8 @@ function detectCardAnswers(videoElement, questionCount) {
 function collectMarkerCandidates(contours, width, height) {
   const candidates = [];
   const minArea = (width * height) * 0.00012;
+  const minSide = Math.max(MIN_MARKER_SIDE, Math.round(Math.min(width, height) * 0.018));
+  const maxSide = Math.max(MAX_MARKER_SIDE, Math.round(Math.min(width, height) * 0.14));
 
   for (let index = 0; index < contours.size(); index += 1) {
     const contour = contours.get(index);
@@ -454,16 +644,23 @@ function collectMarkerCandidates(contours, width, height) {
     const rect = cv.boundingRect(contour);
     const aspect = rect.width / Math.max(rect.height, 1);
     const fillRatio = area / Math.max(rect.width * rect.height, 1);
+    const convex = cv.isContourConvex(approx);
+    const hull = new cv.Mat();
+    cv.convexHull(contour, hull, false, true);
+    const hullArea = cv.contourArea(hull);
+    const solidity = area / Math.max(hullArea, 1);
 
     if (
       approx.rows === 4 &&
+      convex &&
       aspect > 0.8 &&
       aspect < 1.2 &&
       fillRatio > MIN_MARKER_FILL_RATIO &&
-      rect.width >= MIN_MARKER_SIDE &&
-      rect.height >= MIN_MARKER_SIDE &&
-      rect.width <= MAX_MARKER_SIDE &&
-      rect.height <= MAX_MARKER_SIDE
+      solidity > 0.86 &&
+      rect.width >= minSide &&
+      rect.height >= minSide &&
+      rect.width <= maxSide &&
+      rect.height <= maxSide
     ) {
       const moments = cv.moments(contour);
       if (moments.m00 !== 0) {
@@ -477,6 +674,7 @@ function collectMarkerCandidates(contours, width, height) {
       }
     }
 
+    hull.delete();
     approx.delete();
     contour.delete();
   }
@@ -506,6 +704,121 @@ function collectMarkerCandidates(contours, width, height) {
           const combo = [unique[a], unique[b], unique[c], unique[d]];
           const ordered = orderCorners(combo.map((item) => item.center));
           const score = rectangleScore(ordered, width, height);
+          if (!best || score > best.score) {
+            best = { score, markers: combo };
+          }
+        }
+      }
+    }
+  }
+
+  return best ? best.markers : unique.slice(0, 4);
+}
+
+function cornerProximityScore(center, width, height) {
+  const corners = [
+    { x: 0, y: 0 },
+    { x: width, y: 0 },
+    { x: width, y: height },
+    { x: 0, y: height },
+  ];
+  const diag = Math.hypot(width, height) || 1;
+  let best = 0;
+  for (const corner of corners) {
+    const d = Math.hypot(center.x - corner.x, center.y - corner.y);
+    const score = 1 - Math.min(1, d / (diag * 0.52));
+    if (score > best) {
+      best = score;
+    }
+  }
+  return best;
+}
+
+function collectMarkerCandidatesV2(contours, width, height) {
+  const candidates = [];
+  const minArea = (width * height) * 0.000095;
+  const minSide = Math.max(MIN_MARKER_SIDE, Math.round(Math.min(width, height) * 0.016));
+  const maxSide = Math.max(MAX_MARKER_SIDE, Math.round(Math.min(width, height) * 0.16));
+
+  for (let index = 0; index < contours.size(); index += 1) {
+    const contour = contours.get(index);
+    const area = cv.contourArea(contour);
+    if (area < minArea) {
+      contour.delete();
+      continue;
+    }
+
+    const rect = cv.boundingRect(contour);
+    const aspect = rect.width / Math.max(rect.height, 1);
+    const fillRatio = area / Math.max(rect.width * rect.height, 1);
+
+    if (
+      aspect < 0.72 ||
+      aspect > 1.38 ||
+      rect.width < minSide ||
+      rect.height < minSide ||
+      rect.width > maxSide ||
+      rect.height > maxSide ||
+      fillRatio < (MIN_MARKER_FILL_RATIO - 0.1)
+    ) {
+      contour.delete();
+      continue;
+    }
+
+    const hull = new cv.Mat();
+    cv.convexHull(contour, hull, false, true);
+    const hullArea = cv.contourArea(hull);
+    const solidity = area / Math.max(hullArea, 1);
+    hull.delete();
+
+    if (solidity < 0.78) {
+      contour.delete();
+      continue;
+    }
+
+    const moments = cv.moments(contour);
+    contour.delete();
+    if (moments.m00 === 0) {
+      continue;
+    }
+    const center = { x: moments.m10 / moments.m00, y: moments.m01 / moments.m00 };
+    const cornerScore = cornerProximityScore(center, width, height);
+
+    candidates.push({
+      area,
+      center,
+      cornerScore,
+    });
+  }
+
+  candidates.sort((left, right) => (right.area + right.cornerScore * 1000) - (left.area + left.cornerScore * 1000));
+  const unique = [];
+  for (const candidate of candidates) {
+    const duplicate = unique.some((item) => distance(item.center, candidate.center) < 18);
+    if (!duplicate) {
+      unique.push(candidate);
+    }
+    if (unique.length >= 14) {
+      break;
+    }
+  }
+
+  if (unique.length < 4) {
+    return [];
+  }
+
+  let best = null;
+  const limit = Math.min(unique.length, 10);
+  for (let a = 0; a < limit - 3; a += 1) {
+    for (let b = a + 1; b < limit - 2; b += 1) {
+      for (let c = b + 1; c < limit - 1; c += 1) {
+        for (let d = c + 1; d < limit; d += 1) {
+          const combo = [unique[a], unique[b], unique[c], unique[d]];
+          const ordered = orderCorners(combo.map((item) => item.center));
+          const rectScore = rectangleScore(ordered, width, height);
+          const cornerBoost =
+            (combo.reduce((sum, item) => sum + (item.cornerScore || 0), 0) / 4) * MARKER_CORNER_BONUS;
+          const score = rectScore * (1 + cornerBoost);
           if (!best || score > best.score) {
             best = { score, markers: combo };
           }
@@ -614,6 +927,146 @@ function readAnswersFromWarped(warpedGray, questionCount) {
 
   thresholded.delete();
   return { answers, rows };
+}
+
+function readAnswersFromWarpedV2(warpedGray, questionCount) {
+  const answers = {};
+  const rows = [];
+
+  const stepX = (CARD_TARGET.rightMarkerX - CARD_TARGET.leftMarkerX) / 6;
+  const stepY = (CARD_TARGET.bottomMarkerY - CARD_TARGET.topMarkerY) / (questionCount + 1);
+  const bubbleRadius = Math.min(stepX, stepY) * 0.34;
+  const roiRadius = bubbleRadius * 0.62;
+  const roiSize = Math.max(22, Math.round(roiRadius * 2.9));
+
+  const innerMask = new cv.Mat.zeros(roiSize, roiSize, cv.CV_8UC1);
+  const ringMask = new cv.Mat.zeros(roiSize, roiSize, cv.CV_8UC1);
+  const center = new cv.Point(Math.floor(roiSize / 2), Math.floor(roiSize / 2));
+  const innerR = Math.max(4, Math.round(roiRadius * 0.9));
+  const outerR = Math.max(innerR + 2, Math.round(roiRadius * 1.25));
+  cv.circle(innerMask, center, innerR, new cv.Scalar(255), -1);
+  cv.circle(ringMask, center, outerR, new cv.Scalar(255), -1);
+  cv.circle(ringMask, center, innerR + 1, new cv.Scalar(0), -1);
+
+  try {
+    for (let questionIndex = 1; questionIndex <= questionCount; questionIndex += 1) {
+      const centerY = CARD_TARGET.topMarkerY + (stepY * questionIndex);
+      const centers = [];
+      const scores = [];
+
+      for (let optionIndex = 1; optionIndex <= 5; optionIndex += 1) {
+        const centerX = CARD_TARGET.leftMarkerX + (stepX * optionIndex);
+        centers.push({ x: centerX, y: centerY });
+        scores.push(sampleBubbleContrastScore(warpedGray, centerX, centerY, roiSize, innerMask, ringMask));
+      }
+
+      const { markedIndices, selectedIndex, confidence, adaptiveThreshold } = classifyBubbleScores(scores);
+      const letter = selectedIndex >= 0 ? ["A", "B", "C", "D", "E"][selectedIndex] : "";
+      if (letter) {
+        answers[String(questionIndex)] = letter;
+      }
+
+      rows.push({
+        questionNumber: questionIndex,
+        centers,
+        scores,
+        markedIndices,
+        selectedIndex,
+        bubbleRadius,
+        confidence,
+        adaptiveThreshold,
+      });
+    }
+  } finally {
+    innerMask.delete();
+    ringMask.delete();
+  }
+
+  return { answers, rows };
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function sampleBubbleContrastScore(grayMat, centerX, centerY, roiSize, innerMask, ringMask) {
+  const half = Math.floor(roiSize / 2);
+  const x0 = clamp(Math.round(centerX) - half, 0, grayMat.cols - roiSize);
+  const y0 = clamp(Math.round(centerY) - half, 0, grayMat.rows - roiSize);
+  const rect = new cv.Rect(x0, y0, roiSize, roiSize);
+  const roi = grayMat.roi(rect);
+  try {
+    const bubbleMean = cv.mean(roi, innerMask)[0];
+    const ringMean = cv.mean(roi, ringMask)[0];
+    const local = Math.max(8, ringMean);
+    const contrast = clamp((ringMean - bubbleMean) / local, 0, 1);
+    const darkness = clamp((255 - bubbleMean) / 255, 0, 1);
+    return clamp((contrast * 0.78) + (darkness * 0.22), 0, 1);
+  } finally {
+    roi.delete();
+  }
+}
+
+function classifyBubbleScores(scores) {
+  const sorted = scores
+    .map((score, index) => ({ score, index }))
+    .sort((a, b) => b.score - a.score);
+
+  const best = sorted[0];
+  const second = sorted[1] || { score: 0, index: -1 };
+
+  const mean = scores.reduce((sum, value) => sum + value, 0) / Math.max(scores.length, 1);
+  const variance = scores.reduce((sum, value) => sum + ((value - mean) ** 2), 0) / Math.max(scores.length, 1);
+  const std = Math.sqrt(variance);
+
+  const adaptiveThreshold = Math.max(BUBBLE_CONTRAST_MIN, mean + (std * 0.75));
+  if (best.score < adaptiveThreshold) {
+    return { markedIndices: [], selectedIndex: -1, confidence: 0, adaptiveThreshold };
+  }
+
+  const relativeAmbiguous = second.score >= best.score * BUBBLE_AMBIGUOUS_RELATIVE;
+  const gapAmbiguous = (best.score - second.score) <= BUBBLE_AMBIGUOUS_GAP;
+  const ambiguous = relativeAmbiguous || gapAmbiguous;
+
+  if (ambiguous) {
+    const threshold = Math.max(adaptiveThreshold, best.score * 0.92);
+    const markedIndices = scores
+      .map((score, index) => ({ score, index }))
+      .filter((item) => item.score >= threshold)
+      .map((item) => item.index);
+    return {
+      markedIndices,
+      selectedIndex: -1,
+      confidence: clamp(best.score - second.score, 0, 1),
+      adaptiveThreshold,
+    };
+  }
+
+  return {
+    markedIndices: [best.index],
+    selectedIndex: best.index,
+    confidence: clamp(best.score - second.score, 0, 1),
+    adaptiveThreshold,
+  };
+}
+
+function drawGridOverlay(baseImageData, rows) {
+  if (!baseImageData || !rows?.length || !state.elements?.alignedCanvas) {
+    return;
+  }
+  drawAlignedPreview(baseImageData);
+  const context = state.elements.alignedCanvas.getContext("2d");
+  context.lineWidth = 2;
+  context.strokeStyle = "#ffb300";
+  context.fillStyle = "rgba(255,179,0,0.25)";
+
+  for (const row of rows) {
+    for (const center of row.centers) {
+      context.beginPath();
+      context.arc(center.x, center.y, row.bubbleRadius * 0.95, 0, Math.PI * 2);
+      context.stroke();
+    }
+  }
 }
 
 function sampleBubbleScore(binaryMat, centerX, centerY, radius) {
@@ -836,8 +1289,17 @@ function distance(left, right) {
 }
 
 function setStatus(text) {
-  if (state.elements.scanStatus) {
+  if (state.elements.scanStatus && !state.cardMode) {
     state.elements.scanStatus.textContent = text;
+  }
+  if (state.elements.cardStatus && state.cardMode) {
+    state.elements.cardStatus.textContent = text;
+  }
+}
+
+function setBadge(text) {
+  if (state.elements.modeBadge) {
+    state.elements.modeBadge.textContent = text;
   }
 }
 
@@ -848,4 +1310,16 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function getQueryFlag(name) {
+  try {
+    const value = new URLSearchParams(window.location.search).get(name);
+    if (value === null) {
+      return false;
+    }
+    return value === "" || value === "1" || value === "true" || value === "on" || value === "yes";
+  } catch {
+    return false;
+  }
 }

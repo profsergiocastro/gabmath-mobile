@@ -10,28 +10,49 @@
   <main class="app-shell">
     <section class="card">
       <h1>GabMath Mobile</h1>
-      <p class="subtitle">Etapa 1: leia apenas o QR Code da prova.</p>
+      <p class="subtitle">Leia o QR Code e em seguida alinhe o cartão-resposta (sem reabrir a câmera).</p>
 
       <div class="status-bar">
         <span id="mode-badge" class="mode-badge">Lendo QR</span>
       </div>
 
-      <div class="step">
+      <div id="step-qr" class="step">
         <h2>Leitura do QR</h2>
         <div class="camera-stack">
           <video id="camera-video" playsinline muted></video>
           <canvas id="camera-overlay"></canvas>
         </div>
         <div class="actions">
-          <button id="start-scan">Iniciar camera</button>
+          <button id="start-scan">Iniciar câmera</button>
           <button id="stop-scan" class="secondary">Parar</button>
         </div>
         <label class="field">
-          <span>Ou cole manualmente o conteudo bruto do QR</span>
+          <span>Ou cole manualmente o conteúdo bruto do QR</span>
           <input id="proof-id-input" type="text" placeholder="Ex.: GABMATH1:eyJ2IjoxLCJpIjoiLi4uIn0">
         </label>
-        <button id="load-proof" class="full">Prosseguir para leitura do cartao</button>
+        <button id="load-proof" class="full">Prosseguir para leitura do cartão</button>
         <p id="scan-status" class="status"></p>
+      </div>
+
+      <div id="step-card" class="step hidden">
+        <h2>Cartão-resposta</h2>
+        <div id="proof-summary" class="summary"></div>
+        <p class="hint">Mantenha visíveis os quatro quadrados pretos. A leitura só será aceita quando a imagem estiver alinhada e nítida.</p>
+        <div class="actions">
+          <button id="start-card-scan" class="full">Iniciar leitura do cartão</button>
+          <button id="stop-card" class="secondary full">Parar</button>
+        </div>
+        <label class="debug-toggle">
+          <input id="debug-toggle" type="checkbox">
+          Debug (mostrar grade e marcadores)
+        </label>
+        <p id="card-status" class="status"></p>
+        <canvas id="aligned-preview" class="aligned-preview"></canvas>
+        <div id="answer-grid" class="answer-grid"></div>
+        <div id="result-panel" class="result hidden"></div>
+        <div class="actions single-column">
+          <button id="back-to-qr" class="secondary full">Ler outro QR</button>
+        </div>
       </div>
     </section>
   </main>
