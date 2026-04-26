@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GabMath Mobile - Resultados</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body data-page="results">
+  <main class="app-shell">
+    <section class="card">
+      <h1>Resultados da Prova</h1>
+      <p class="subtitle">Consulte, organize e exporte os resultados corrigidos.</p>
+
+      <div class="status-bar">
+        <span id="mode-badge" class="mode-badge">Resultados</span>
+      </div>
+
+      <div class="step">
+        <div class="summary">
+          <label class="field" style="margin-top: 0;">
+            <span>Prova</span>
+            <select id="exam-select"></select>
+          </label>
+          <div class="actions single-column" style="margin-top: 0;">
+            <a class="button-link secondary-link" href="./index.html">Voltar para correção</a>
+          </div>
+        </div>
+
+        <div id="exam-summary" class="summary"></div>
+
+        <div class="field">
+          <span>Buscar aluno</span>
+          <input id="student-search" type="text" placeholder="Digite o nome do aluno">
+        </div>
+        <label class="field">
+          <span>Ordenar</span>
+          <select id="sort-select">
+            <option value="name_asc">Nome (A → Z)</option>
+            <option value="name_desc">Nome (Z → A)</option>
+            <option value="score_desc">Nota (maior → menor)</option>
+            <option value="score_asc">Nota (menor → maior)</option>
+            <option value="correct_desc">Acertos (maior → menor)</option>
+            <option value="correct_asc">Acertos (menor → maior)</option>
+            <option value="date_desc" selected>Correção (mais recente)</option>
+            <option value="date_asc">Correção (mais antiga)</option>
+          </select>
+        </label>
+
+        <div class="table-wrap">
+          <table class="results-table">
+            <thead>
+              <tr>
+                <th>Aluno</th>
+                <th>Nota</th>
+                <th>Acertos</th>
+                <th>Erros</th>
+                <th>%</th>
+                <th>Data/Hora</th>
+                <th>Ações</th>
+              </tr>
+            </thead>
+            <tbody id="results-tbody"></tbody>
+          </table>
+        </div>
+
+        <h2 style="margin-top: 18px;">Estatísticas por questão</h2>
+        <div id="question-stats" class="answer-grid"></div>
+
+        <h2 style="margin-top: 18px;">Exportar</h2>
+        <div class="actions single-column">
+          <button id="export-students-csv" class="full">Exportar CSV (alunos)</button>
+          <button id="export-questions-csv" class="full">Exportar CSV (questões)</button>
+          <button id="export-json" class="secondary full">Exportar JSON completo</button>
+        </div>
+
+        <dialog id="student-dialog" class="student-dialog">
+          <div id="student-dialog-body"></div>
+          <div class="actions single-column">
+            <button id="close-student-dialog" class="secondary full">Fechar</button>
+          </div>
+        </dialog>
+      </div>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
+

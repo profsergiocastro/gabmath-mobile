@@ -1,5 +1,6 @@
 const QR_PAYLOAD_PREFIX = "GABMATH1:";
 const STORAGE_KEY = "gabmath-current-proof";
+const RESULTS_STORAGE_KEY = "gabmath-exam-results-v1";
 const CARD_TARGET = {
   width: 820,
   height: 1160,
@@ -50,6 +51,7 @@ const state = {
   qrProcessing: false,
   lastQrValue: "",
   lastQrAt: 0,
+  lastResult: null,
   elements: {},
   page: "",
 };
@@ -67,6 +69,10 @@ function initializeApp() {
   }
   if (state.page === "card") {
     initializeCardPage();
+    return;
+  }
+  if (state.page === "results") {
+    initializeResultsPage();
   }
 }
 
@@ -173,6 +179,415 @@ function initializeCardPage() {
   setWorkflowState("waitingUserToStartAnswerScan");
   updateCardControls();
   setStatus("Alinhe o celular com o cartão-resposta e toque em “Habilitar câmera”.");
+}
+
+function initializeResultsPage() {
+  state.elements = {
+    modeBadge: document.getElementById("mode-badge"),
+    examSelect: document.getElementById("exam-select"),
+    examSummary: document.getElementById("exam-summary"),
+    resultsTbody: document.getElementById("results-tbody"),
+    sortSelect: document.getElementById("sort-select"),
+    studentSearch: document.getElementById("student-search"),
+    questionStats: document.getElementById("question-stats"),
+    exportStudentsCsv: document.getElementById("export-students-csv"),
+    exportQuestionsCsv: document.getElementById("export-questions-csv"),
+    exportJson: document.getElementById("export-json"),
+    studentDialog: document.getElementById("student-dialog"),
+    studentDialogBody: document.getElementById("student-dialog-body"),
+    closeStudentDialog: document.getElementById("close-student-dialog"),
+  };
+
+  setBadge("Resultados");
+
+  const store = loadResultsStore();
+  const examIds = Object.keys(store.exams || {}).sort((a, b) => a.localeCompare(b));
+  if (!examIds.length) {
+    state.elements.examSelect.innerHTML = "<option value=\"\">Nenhuma prova salva</option>";
+    state.elements.examSummary.innerHTML = "<div>Nenhum resultado salvo ainda.</div>";
+    return;
+  }
+
+  const selectedFromQuery = getQueryParam("examId");
+  const selectedExamId = selectedFromQuery && examIds.includes(selectedFromQuery) ? selectedFromQuery : examIds[0];
+
+  state.elements.examSelect.innerHTML = examIds
+    .map((examId) => `<option value="${escapeHtml(examId)}"${examId === selectedExamId ? " selected" : ""}>${escapeHtml(examId)}</option>`)
+    .join("");
+
+  state.elements.examSelect.addEventListener("change", () => {
+    const next = state.elements.examSelect.value;
+    window.history.replaceState({}, "", `./resultados.html?examId=${encodeURIComponent(next)}`);
+    renderResultsPage();
+  });
+  state.elements.sortSelect.addEventListener("change", renderResultsPage);
+  state.elements.studentSearch.addEventListener("input", renderResultsPage);
+  state.elements.exportStudentsCsv.addEventListener("click", () => exportStudentsCsv(state.elements.examSelect.value));
+  state.elements.exportQuestionsCsv.addEventListener("click", () => exportQuestionsCsv(state.elements.examSelect.value));
+  state.elements.exportJson.addEventListener("click", () => exportExamJson(state.elements.examSelect.value));
+  state.elements.closeStudentDialog.addEventListener("click", () => state.elements.studentDialog.close());
+
+  renderResultsPage();
+}
+
+function getQueryParam(name) {
+  try {
+    return new URLSearchParams(window.location.search).get(name) || "";
+  } catch {
+    return "";
+  }
+}
+
+function renderResultsPage() {
+  const examId = state.elements.examSelect.value;
+  const store = loadResultsStore();
+  const exam = store.exams?.[examId];
+  if (!exam) {
+    state.elements.examSummary.innerHTML = "<div>Prova não encontrada.</div>";
+    state.elements.resultsTbody.innerHTML = "";
+    state.elements.questionStats.innerHTML = "";
+    return;
+  }
+
+  const results = Array.isArray(exam.results) ? [...exam.results] : [];
+  const filtered = filterResultsByStudentName(results, state.elements.studentSearch.value);
+  const sorted = sortResults(filtered, state.elements.sortSelect.value);
+
+  renderExamSummary(exam, results);
+  renderResultsTable(examId, sorted);
+  renderQuestionStats(exam, results);
+}
+
+function filterResultsByStudentName(results, query) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) {
+    return results;
+  }
+  return results.filter((item) => String(item.studentName || "").toLowerCase().includes(q));
+}
+
+function sortResults(results, mode) {
+  const parseDate = (value) => (value ? Date.parse(value) : 0);
+  const compareText = (a, b) => String(a || "").localeCompare(String(b || ""), "pt-BR");
+  const compareNumber = (a, b) => (Number(a) || 0) - (Number(b) || 0);
+
+  const list = [...results];
+  switch (mode) {
+    case "name_desc":
+      list.sort((a, b) => compareText(b.studentName, a.studentName));
+      break;
+    case "score_asc":
+      list.sort((a, b) => compareNumber(a.score, b.score));
+      break;
+    case "score_desc":
+      list.sort((a, b) => compareNumber(b.score, a.score));
+      break;
+    case "correct_asc":
+      list.sort((a, b) => compareNumber(a.correctCount, b.correctCount));
+      break;
+    case "correct_desc":
+      list.sort((a, b) => compareNumber(b.correctCount, a.correctCount));
+      break;
+    case "date_asc":
+      list.sort((a, b) => parseDate(a.correctedAt) - parseDate(b.correctedAt));
+      break;
+    case "date_desc":
+      list.sort((a, b) => parseDate(b.correctedAt) - parseDate(a.correctedAt));
+      break;
+    case "name_asc":
+    default:
+      list.sort((a, b) => compareText(a.studentName, b.studentName));
+      break;
+  }
+  return list;
+}
+
+function calculateMedian(values) {
+  const nums = values.map((v) => Number(v) || 0).sort((a, b) => a - b);
+  if (!nums.length) {
+    return 0;
+  }
+  const mid = Math.floor(nums.length / 2);
+  if (nums.length % 2 === 0) {
+    return (nums[mid - 1] + nums[mid]) / 2;
+  }
+  return nums[mid];
+}
+
+function calculateStandardDeviation(values) {
+  const nums = values.map((v) => Number(v) || 0);
+  if (!nums.length) {
+    return 0;
+  }
+  const mean = nums.reduce((s, v) => s + v, 0) / nums.length;
+  const variance = nums.reduce((s, v) => s + ((v - mean) ** 2), 0) / nums.length;
+  return Math.sqrt(variance);
+}
+
+function renderExamSummary(exam, results) {
+  const scores = results.map((r) => Number(r.score) || 0);
+  const totalStudents = results.length;
+  const mean = totalStudents ? (scores.reduce((s, v) => s + v, 0) / totalStudents) : 0;
+  const median = calculateMedian(scores);
+  const max = totalStudents ? Math.max(...scores) : 0;
+  const min = totalStudents ? Math.min(...scores) : 0;
+  const stdev = calculateStandardDeviation(scores);
+
+  state.elements.examSummary.innerHTML = `
+    <div><strong>Prova:</strong> ${escapeHtml(exam.examName || exam.examId || "")}</div>
+    <div><strong>Alunos corrigidos:</strong> ${totalStudents}</div>
+    <div><strong>Média:</strong> ${mean.toFixed(2)}</div>
+    <div><strong>Mediana:</strong> ${median.toFixed(2)}</div>
+    <div><strong>Maior:</strong> ${max.toFixed(2)}</div>
+    <div><strong>Menor:</strong> ${min.toFixed(2)}</div>
+    <div><strong>Desvio padrão:</strong> ${stdev.toFixed(2)}</div>
+  `;
+}
+
+function formatDateTime(iso) {
+  try {
+    const date = new Date(iso);
+    return date.toLocaleString("pt-BR");
+  } catch {
+    return String(iso || "");
+  }
+}
+
+function renderResultsTable(examId, results) {
+  const rows = results.map((item) => {
+    const percent = Number(item.percentage || 0);
+    const pillClass = percent >= 70 ? "ok" : (percent >= 40 ? "neutral" : "bad");
+    return `
+      <tr>
+        <td>${escapeHtml(item.studentName || "")}</td>
+        <td>${Number(item.score || 0).toFixed(2)}</td>
+        <td>${Number(item.correctCount || 0)}</td>
+        <td>${Number(item.wrongCount || 0)}</td>
+        <td><span class="pill ${pillClass}">${percent.toFixed(2)}%</span></td>
+        <td>${escapeHtml(formatDateTime(item.correctedAt))}</td>
+        <td class="actions-cell">
+          <button data-action="details" data-student="${escapeHtml(item.studentName || "")}">Detalhes</button>
+          <button class="secondary" data-action="delete" data-student="${escapeHtml(item.studentName || "")}">Excluir</button>
+        </td>
+      </tr>
+    `;
+  }).join("");
+
+  state.elements.resultsTbody.innerHTML = rows || "<tr><td colspan=\"7\">Nenhum aluno encontrado.</td></tr>";
+
+  for (const button of state.elements.resultsTbody.querySelectorAll("button[data-action]")) {
+    button.addEventListener("click", () => {
+      const action = button.dataset.action;
+      const student = button.dataset.student;
+      if (action === "details") {
+        openStudentDetails(examId, student);
+      } else if (action === "delete") {
+        deleteStudentResult(examId, student);
+      }
+    });
+  }
+}
+
+function openStudentDetails(examId, studentName) {
+  const store = loadResultsStore();
+  const exam = store.exams?.[examId];
+  const row = (exam?.results || []).find((item) => String(item.studentName || "") === String(studentName || ""));
+  if (!row) {
+    return;
+  }
+
+  const lines = [];
+  lines.push(`<div class="dialog-body">`);
+  lines.push(`<h2 style="margin:0 0 8px;">${escapeHtml(row.studentName || "")}</h2>`);
+  lines.push(`<div><strong>Nota:</strong> ${(Number(row.score || 0)).toFixed(2)} (${(Number(row.percentage || 0)).toFixed(2)}%)</div>`);
+  lines.push(`<div><strong>Acertos:</strong> ${Number(row.correctCount || 0)} | <strong>Erros:</strong> ${Number(row.wrongCount || 0)}</div>`);
+  lines.push(`<div><strong>Correção:</strong> ${escapeHtml(formatDateTime(row.correctedAt))}</div>`);
+
+  for (const qid of exam.questionIds || []) {
+    const meta = row.questionMeta?.[qid] || {};
+    const status = String(meta.status || "em_branco");
+    const css = status === "correta" ? "correct" : (status === "em_branco" ? "blank" : (status === "anulada" ? "annulled" : "wrong"));
+    const marcada = status === "correta" || status === "errada" ? (meta.marcada || "") : "";
+    const marcadas = Array.isArray(meta.marcadas) && meta.marcadas.length ? meta.marcadas.join(",") : "";
+    lines.push(`
+      <div class="question-line ${css}">
+        <div><strong>${escapeHtml(qid)}</strong></div>
+        <div><strong>Marcada:</strong> ${escapeHtml(marcada || marcadas || "-")}</div>
+        <div><strong>Correta:</strong> ${escapeHtml(meta.correta || "")}</div>
+        <div><strong>Status:</strong> ${escapeHtml(status.replaceAll("_", " "))}</div>
+      </div>
+    `);
+  }
+
+  lines.push(`</div>`);
+  state.elements.studentDialogBody.innerHTML = lines.join("");
+  state.elements.studentDialog.showModal();
+}
+
+function deleteStudentResult(examId, studentName) {
+  const confirmed = window.confirm(`Excluir o resultado de ${studentName}?`);
+  if (!confirmed) {
+    return;
+  }
+  const store = loadResultsStore();
+  const exam = store.exams?.[examId];
+  if (!exam) {
+    return;
+  }
+  exam.results = (exam.results || []).filter((item) => String(item.studentName || "") !== String(studentName || ""));
+  saveResultsStore(store);
+  renderResultsPage();
+}
+
+function calculateQuestionStats(exam, results) {
+  const stats = [];
+  const questionIds = exam.questionIds || [];
+  for (const qid of questionIds) {
+    const correctLetter = String(exam.answerKey?.[qid] || "").toUpperCase();
+    const counts = { A: 0, B: 0, C: 0, D: 0, E: 0, blank: 0, multiple: 0, ambiguous: 0 };
+    let correct = 0;
+    for (const row of results) {
+      const meta = row.questionMeta?.[qid];
+      if (!meta) {
+        counts.blank += 1;
+        continue;
+      }
+      const status = String(meta.status || "em_branco");
+      if (status === "correta") {
+        correct += 1;
+      }
+      if (status === "em_branco") {
+        counts.blank += 1;
+        continue;
+      }
+      if (status === "multipla_marcacao") {
+        counts.multiple += 1;
+      }
+      if (status === "ambigua") {
+        counts.ambiguous += 1;
+      }
+      const marcada = String(meta.marcada || "");
+      if (marcada && counts[marcada] !== undefined) {
+        counts[marcada] += 1;
+      }
+    }
+    const total = results.length || 1;
+    const correctPct = (correct / total) * 100;
+    const difficulty = correctPct >= 70 ? "Fácil" : (correctPct >= 40 ? "Média" : "Difícil");
+    const entries = Object.entries({ A: counts.A, B: counts.B, C: counts.C, D: counts.D, E: counts.E, "Em branco": counts.blank })
+      .sort((a, b) => b[1] - a[1]);
+    const mostMarked = entries[0]?.[0] || "-";
+    stats.push({
+      qid,
+      correctLetter,
+      correct,
+      wrong: total - correct,
+      blank: counts.blank,
+      correctPct,
+      difficulty,
+      mostMarked,
+      counts,
+    });
+  }
+  return stats;
+}
+
+function renderQuestionStats(exam, results) {
+  const stats = calculateQuestionStats(exam, results);
+  if (!stats.length) {
+    state.elements.questionStats.innerHTML = "<div>Nenhuma questão encontrada.</div>";
+    return;
+  }
+  const cards = stats.map((item) => {
+    const pct = item.correctPct;
+    const pillClass = pct >= 70 ? "ok" : (pct >= 40 ? "neutral" : "bad");
+    return `
+      <div class="question-line ${pct >= 70 ? "correct" : (pct >= 40 ? "blank" : "wrong")}">
+        <div><strong>${escapeHtml(item.qid)}</strong></div>
+        <div><strong>Correta:</strong> ${escapeHtml(item.correctLetter)}</div>
+        <div><strong>Acerto:</strong> <span class="pill ${pillClass}">${pct.toFixed(1)}%</span></div>
+        <div><strong>Dificuldade:</strong> ${escapeHtml(item.difficulty)}</div>
+      </div>
+    `;
+  }).join("");
+  state.elements.questionStats.innerHTML = cards;
+}
+
+function downloadBlob(filename, content, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function exportStudentsCsv(examId) {
+  const store = loadResultsStore();
+  const exam = store.exams?.[examId];
+  if (!exam || !(exam.results || []).length) {
+    alert("Não há resultados para exportar.");
+    return;
+  }
+  const qids = exam.questionIds || [];
+  const header = ["Aluno", "Nota", "Acertos", "Erros", "Percentual", "Data/Hora", ...qids];
+  const rows = (exam.results || []).map((r) => {
+    const base = [
+      r.studentName,
+      Number(r.score || 0).toFixed(2),
+      r.correctCount,
+      r.wrongCount,
+      Number(r.percentage || 0).toFixed(2),
+      r.correctedAt,
+    ];
+    const answers = qids.map((qid) => String(r.answers?.[qid] || ""));
+    return [...base, ...answers];
+  });
+  const csv = [header, ...rows].map((line) => line.map(csvEscape).join(",")).join("\n");
+  downloadBlob(`${examId}-alunos.csv`, csv, "text/csv;charset=utf-8");
+}
+
+function exportQuestionsCsv(examId) {
+  const store = loadResultsStore();
+  const exam = store.exams?.[examId];
+  if (!exam || !(exam.results || []).length) {
+    alert("Não há resultados para exportar.");
+    return;
+  }
+  const stats = calculateQuestionStats(exam, exam.results || []);
+  const header = ["Questão", "Correta", "% Acerto", "Acertos", "Erros", "Em branco", "Mais marcada", "Dificuldade"];
+  const rows = stats.map((s) => [
+    s.qid,
+    s.correctLetter,
+    s.correctPct.toFixed(2),
+    s.correct,
+    s.wrong,
+    s.blank,
+    s.mostMarked,
+    s.difficulty,
+  ]);
+  const csv = [header, ...rows].map((line) => line.map(csvEscape).join(",")).join("\n");
+  downloadBlob(`${examId}-questoes.csv`, csv, "text/csv;charset=utf-8");
+}
+
+function exportExamJson(examId) {
+  const store = loadResultsStore();
+  const exam = store.exams?.[examId];
+  if (!exam) {
+    alert("Prova não encontrada.");
+    return;
+  }
+  downloadBlob(`${examId}.json`, JSON.stringify(exam, null, 2), "application/json;charset=utf-8");
+}
+
+function csvEscape(value) {
+  const text = String(value ?? "");
+  const needs = /[",\n]/.test(text);
+  const escaped = text.replaceAll("\"", "\"\"");
+  return needs ? `"${escaped}"` : escaped;
 }
 
 async function startQrCamera() {
@@ -1828,6 +2243,7 @@ function drawFilledDot(context, center, radius, color) {
 
 function correctProof() {
   const result = correctProofLocally(state.proof, state.answers, state.lastDetection?.rows || []);
+  state.lastResult = result;
   const yellowPoints = drawCorrectionPreview(result);
   state.elements.resultPanel.classList.remove("hidden");
   state.elements.resultPanel.classList.toggle("wrong", result.acertos !== result.total);
@@ -1876,6 +2292,7 @@ function resetReadingUi() {
   state.stableSignature = "";
   state.stableCount = 0;
   state.lastDetection = null;
+  state.lastResult = null;
   if (state.elements?.resultPanel) {
     state.elements.resultPanel.classList.add("hidden");
     state.elements.resultPanel.innerHTML = "";
@@ -1979,8 +2396,23 @@ function retakePhoto() {
 }
 
 function confirmReading() {
-  setStatus("Leitura confirmada.");
-  // Mantém resultados na tela; usuário pode tocar em "Ler outro QR" se desejar.
+  if (!state.proof || !state.lastResult) {
+    setStatus("Nenhum resultado para confirmar.");
+    return;
+  }
+
+  try {
+    saveStudentResult({
+      proof: state.proof,
+      result: state.lastResult,
+    });
+  } catch (error) {
+    setStatus(error?.message || String(error));
+    return;
+  }
+
+  const examId = String(state.proof.id_prova || "").trim() || "prova";
+  window.location.href = `./resultados.html?examId=${encodeURIComponent(examId)}`;
 }
 
 function cancelReading() {
@@ -1988,6 +2420,132 @@ function cancelReading() {
   stopAnswerCamera();
   setWorkflowState("waitingUserToStartAnswerScan", "Leitura cancelada. Toque em “Habilitar câmera” para tentar novamente.");
   updateCardControls();
+}
+
+function loadResultsStore() {
+  try {
+    const raw = localStorage.getItem(RESULTS_STORAGE_KEY);
+    if (!raw) {
+      return { exams: {} };
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return { exams: {} };
+    }
+    if (!parsed.exams || typeof parsed.exams !== "object") {
+      return { exams: {} };
+    }
+    return parsed;
+  } catch {
+    return { exams: {} };
+  }
+}
+
+function saveResultsStore(store) {
+  localStorage.setItem(RESULTS_STORAGE_KEY, JSON.stringify(store));
+}
+
+function questionIdForNumber(number) {
+  return `Q${String(number).padStart(3, "0")}`;
+}
+
+function toIsoNow() {
+  return new Date().toISOString();
+}
+
+function saveStudentResult({ proof, result }) {
+  const examId = String(proof.id_prova || "").trim() || "prova";
+  const examName = String(proof.id_prova || "").trim() || "Prova";
+  const studentName = String(proof.aluno || "").trim() || "Aluno";
+
+  const answerKey = {};
+  const questionIds = [];
+  for (const question of proof.questoes || []) {
+    const qid = questionIdForNumber(question.numero);
+    questionIds.push(qid);
+    answerKey[qid] = String(question.correta_letra || "").toUpperCase();
+  }
+
+  const answers = {};
+  const questionStatus = {};
+  const questionMeta = {};
+
+  for (const detail of result.detalhes || []) {
+    const qid = questionIdForNumber(detail.numero);
+    const status = String(detail.status || "em_branco");
+    const expected = String(detail.correta || "").toUpperCase();
+    const marked = String(detail.marcada || "").toUpperCase();
+
+    const normalizedStatus = status === "respondida"
+      ? (detail.acertou ? "correta" : "errada")
+      : (status === "em_branco" ? "em_branco" : (status === "multipla_marcacao" ? "multipla_marcacao" : "ambigua"));
+
+    answers[qid] = status === "respondida" ? marked : "";
+    questionStatus[qid] = normalizedStatus;
+    questionMeta[qid] = {
+      numero: detail.numero,
+      correta: expected,
+      marcada: marked,
+      marcadas: detail.marcadas || [],
+      status: normalizedStatus,
+    };
+  }
+
+  const store = loadResultsStore();
+  store.exams ||= {};
+  store.exams[examId] ||= {
+    examId,
+    examName,
+    answerKey,
+    questionIds,
+    results: [],
+    annulled: {},
+  };
+
+  // Atualiza gabarito se já existir (mantém o mais recente).
+  store.exams[examId].answerKey = answerKey;
+  store.exams[examId].questionIds = questionIds;
+  store.exams[examId].examName = store.exams[examId].examName || examName;
+
+  const correctedAt = toIsoNow();
+  const total = Number(result.total || 0);
+  const correctCount = Number(result.acertos || 0);
+  const wrongCount = Math.max(0, total - correctCount);
+  const percentage = total ? Math.round((correctCount / total) * 10000) / 100 : 0;
+
+  const row = {
+    studentName,
+    examId,
+    correctedAt,
+    score: Number(result.nota || 0),
+    correctCount,
+    wrongCount,
+    blankCount: Number(result.brancos || 0),
+    multipleCount: Number(result.multiplas || 0),
+    ambiguousCount: Number(result.ambiguas || 0),
+    percentage,
+    answers,
+    answerKey,
+    questionStatus,
+    questionMeta,
+  };
+
+  const existingIndex = (store.exams[examId].results || []).findIndex(
+    (item) => String(item.studentName || "").trim().toLowerCase() === studentName.toLowerCase()
+  );
+  if (existingIndex >= 0) {
+    const replace = window.confirm(
+      `Já existe um resultado para ${studentName} nesta prova. Deseja substituir?`
+    );
+    if (!replace) {
+      throw new Error("Resultado não salvo.");
+    }
+    store.exams[examId].results[existingIndex] = row;
+  } else {
+    store.exams[examId].results.push(row);
+  }
+
+  saveResultsStore(store);
 }
 
 function correctProofLocally(proof, answers, rows) {
