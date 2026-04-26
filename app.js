@@ -24,6 +24,13 @@ const BUBBLE_CONTRAST_MIN = 0.085;
 const BUBBLE_AMBIGUOUS_RELATIVE = 0.9;
 const BUBBLE_AMBIGUOUS_GAP = 0.035;
 const MARKER_CORNER_BONUS = 0.6;
+const CARD_ASPECT = CARD_TARGET.width / CARD_TARGET.height;
+
+// Marcadores (multiescala): aceitar quadrados pequenos (cartão longe) e grandes (cartão perto).
+const MARKER_MIN_AREA_RATIO = 0.00002;
+const MARKER_MAX_AREA_RATIO = 0.015;
+const MARKER_MIN_SIDE_RATIO = 0.006;
+const MARKER_MAX_SIDE_RATIO = 0.28;
 
 const state = {
   stream: null,
@@ -814,49 +821,59 @@ function detectCardAnswersFromCanvas(canvasElement, questionCount) {
   try {
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
     cv.equalizeHist(gray, gray);
-    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
-    cv.threshold(blur, thresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
-    if (state.opencvKernel) {
-      cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
-    }
+    // Multiescala: procura marcadores em vários tamanhos para tolerar distância.
+    let markers = findMarkersMultiScale(gray);
 
-    let markers = findMarkersV2(thresh, canvasElement.width, canvasElement.height);
+    // Fallback: pipeline antigo por threshold único.
     if (markers.length < 4) {
-      markers = findMarkers(thresh, canvasElement.width, canvasElement.height);
-    }
-
-    if (markers.length < 4) {
-      cv.adaptiveThreshold(
-        blur,
-        thresh,
-        255,
-        cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv.THRESH_BINARY_INV,
-        31,
-        7,
-      );
+      cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+      cv.threshold(blur, thresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
       if (state.opencvKernel) {
         cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
       }
       markers = findMarkersV2(thresh, canvasElement.width, canvasElement.height);
       if (markers.length < 4) {
-        markers = findMarkers(thresh, canvasElement.width, canvasElement.height);
+        cv.adaptiveThreshold(
+          blur,
+          thresh,
+          255,
+          cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+          cv.THRESH_BINARY_INV,
+          31,
+          7,
+        );
+        if (state.opencvKernel) {
+          cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
+        }
+        markers = findMarkersV2(thresh, canvasElement.width, canvasElement.height);
       }
       if (markers.length < 4) {
-        return null;
+        return { ok: false, reason: "markers_not_found" };
+      }
+    }
+
+    if (state.debug) {
+      try {
+        const preview = new cv.Mat();
+        cv.cvtColor(gray, preview, cv.COLOR_GRAY2RGBA);
+        const imageData = matToImageData(preview);
+        preview.delete();
+        drawMarkerSelectionDebug(imageData, markers.slice(0, 4));
+      } catch {
+        // ignore
       }
     }
 
     const corners = orderCorners(markers.slice(0, 4).map((marker) => marker.center));
     if (rectangleScore(corners, canvasElement.width, canvasElement.height) < MIN_CARD_RECTANGLE_SCORE) {
-      return null;
+      return { ok: false, reason: "bad_geometry" };
     }
 
     const warped = perspectiveWarp(gray, corners);
     const focusScore = measureFocus(warped);
-    if (focusScore < MIN_FOCUS_SCORE * 0.75) {
+    if (focusScore < MIN_FOCUS_SCORE * 0.65) {
       warped.delete();
-      return null;
+      return { ok: false, reason: "blur" };
     }
 
     const basePreview = new cv.Mat();
@@ -878,6 +895,7 @@ function detectCardAnswersFromCanvas(canvasElement, questionCount) {
     }
 
     return {
+      ok: true,
       corners,
       answers: reading.answers,
       rows: reading.rows,
@@ -889,6 +907,29 @@ function detectCardAnswersFromCanvas(canvasElement, questionCount) {
     gray.delete();
     blur.delete();
     thresh.delete();
+  }
+}
+
+function drawMarkerSelectionDebug(imageData, markers) {
+  if (!imageData || !state.elements?.alignedCanvas) {
+    return;
+  }
+  // Reutiliza o canvas de preview alinhado para exibir a foto com marcações.
+  state.elements.alignedCanvas.width = imageData.width;
+  state.elements.alignedCanvas.height = imageData.height;
+  const context = state.elements.alignedCanvas.getContext("2d");
+  context.putImageData(imageData, 0, 0);
+  if (!markers?.length) {
+    return;
+  }
+  context.lineWidth = 4;
+  context.strokeStyle = "#ffb300";
+  for (const marker of markers) {
+    const x = marker.center.x;
+    const y = marker.center.y;
+    context.beginPath();
+    context.arc(x, y, 16, 0, Math.PI * 2);
+    context.stroke();
   }
 }
 
@@ -909,11 +950,101 @@ function findMarkersV2(binaryMat, width, height) {
   const hierarchy = new cv.Mat();
   try {
     cv.findContours(binaryMat, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    return collectMarkerCandidatesV2(contours, width, height);
+    return collectMarkerCandidatesV3(contours, width, height);
   } finally {
     contours.delete();
     hierarchy.delete();
   }
+}
+
+function findMarkersMultiScale(grayMat) {
+  const scales = [1.0, 0.8, 0.62, 0.48];
+  const candidates = [];
+
+  for (const scale of scales) {
+    const scaled = new cv.Mat();
+    const blur = new cv.Mat();
+    const thresh = new cv.Mat();
+    try {
+      if (scale === 1.0) {
+        grayMat.copyTo(scaled);
+      } else {
+        const size = new cv.Size(
+          Math.max(1, Math.round(grayMat.cols * scale)),
+          Math.max(1, Math.round(grayMat.rows * scale)),
+        );
+        cv.resize(grayMat, scaled, size, 0, 0, cv.INTER_AREA);
+      }
+
+      cv.GaussianBlur(scaled, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+      cv.threshold(blur, thresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+      if (state.opencvKernel) {
+        cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
+      }
+
+      let markers = findMarkersV2(thresh, scaled.cols, scaled.rows);
+      if (markers.length < 4) {
+        markers = findMarkers(thresh, scaled.cols, scaled.rows);
+      }
+
+      for (const marker of markers) {
+        candidates.push({
+          ...marker,
+          center: { x: marker.center.x / scale, y: marker.center.y / scale },
+          area: (marker.area || 0) / (scale * scale),
+          _scale: scale,
+        });
+      }
+    } finally {
+      scaled.delete();
+      blur.delete();
+      thresh.delete();
+    }
+  }
+
+  if (candidates.length < 4) {
+    return [];
+  }
+
+  // Dedupe no espaço original.
+  candidates.sort((a, b) => ((b.squareScore || 0) - (a.squareScore || 0)) || ((b.cornerScore || 0) - (a.cornerScore || 0)));
+  const unique = [];
+  for (const candidate of candidates) {
+    const duplicate = unique.some((item) => distance(item.center, candidate.center) < 22);
+    if (!duplicate) {
+      unique.push(candidate);
+    }
+    if (unique.length >= 22) {
+      break;
+    }
+  }
+
+  if (unique.length < 4) {
+    return [];
+  }
+
+  let best = null;
+  const limit = Math.min(unique.length, 14);
+  for (let a = 0; a < limit - 3; a += 1) {
+    for (let b = a + 1; b < limit - 2; b += 1) {
+      for (let c = b + 1; c < limit - 1; c += 1) {
+        for (let d = c + 1; d < limit; d += 1) {
+          const combo = [unique[a], unique[b], unique[c], unique[d]];
+          const ordered = orderCorners(combo.map((item) => item.center));
+          const rectScore = rectangleScore(ordered, grayMat.cols, grayMat.rows);
+          const cornerBoost =
+            (combo.reduce((sum, item) => sum + (item.cornerScore || 0), 0) / 4) * MARKER_CORNER_BONUS;
+          const squareBoost = combo.reduce((sum, item) => sum + (item.squareScore || 0), 0) / 4;
+          const score = rectScore * (1 + cornerBoost) * (0.55 + (squareBoost * 0.45));
+          if (!best || score > best.score) {
+            best = { score, markers: combo };
+          }
+        }
+      }
+    }
+  }
+
+  return best ? best.markers : unique.slice(0, 4);
 }
 
 function collectMarkerCandidates(contours, width, height) {
@@ -1122,6 +1253,138 @@ function collectMarkerCandidatesV2(contours, width, height) {
   return best ? best.markers : unique.slice(0, 4);
 }
 
+function collectMarkerCandidatesV3(contours, width, height) {
+  const candidates = [];
+  const frameArea = width * height;
+  const minArea = frameArea * MARKER_MIN_AREA_RATIO;
+  const maxArea = frameArea * MARKER_MAX_AREA_RATIO;
+  const minDim = Math.min(width, height);
+  const minSide = Math.max(8, Math.round(minDim * MARKER_MIN_SIDE_RATIO));
+  const maxSide = Math.max(24, Math.round(minDim * MARKER_MAX_SIDE_RATIO));
+
+  for (let index = 0; index < contours.size(); index += 1) {
+    const contour = contours.get(index);
+    const area = cv.contourArea(contour);
+    if (area < minArea || area > maxArea) {
+      contour.delete();
+      continue;
+    }
+
+    let rectWidth = 0;
+    let rectHeight = 0;
+    try {
+      const rrect = cv.minAreaRect(contour);
+      rectWidth = Math.max(rrect.size.width, rrect.size.height);
+      rectHeight = Math.min(rrect.size.width, rrect.size.height);
+    } catch {
+      const rect = cv.boundingRect(contour);
+      rectWidth = rect.width;
+      rectHeight = rect.height;
+    }
+
+    const aspect = rectWidth / Math.max(rectHeight, 1);
+    const fillRatio = area / Math.max(rectWidth * rectHeight, 1);
+
+    if (
+      aspect < 0.66 ||
+      aspect > 1.52 ||
+      rectWidth < minSide ||
+      rectHeight < minSide ||
+      rectWidth > maxSide ||
+      rectHeight > maxSide ||
+      fillRatio < 0.50
+    ) {
+      contour.delete();
+      continue;
+    }
+
+    const hull = new cv.Mat();
+    cv.convexHull(contour, hull, false, true);
+    const hullArea = cv.contourArea(hull);
+    const solidity = area / Math.max(hullArea, 1);
+    hull.delete();
+
+    if (solidity < 0.72) {
+      contour.delete();
+      continue;
+    }
+
+    const moments = cv.moments(contour);
+    contour.delete();
+    if (moments.m00 === 0) {
+      continue;
+    }
+
+    const center = { x: moments.m10 / moments.m00, y: moments.m01 / moments.m00 };
+    const cornerScore = cornerProximityScore(center, width, height);
+    const aspectSquare = Math.min(rectWidth, rectHeight) / Math.max(rectWidth, rectHeight, 1);
+    const squareScore = clamp(aspectSquare * fillRatio * solidity, 0, 1);
+
+    candidates.push({
+      area,
+      center,
+      cornerScore,
+      squareScore,
+    });
+  }
+
+  candidates.sort((left, right) => {
+    const leftScore = (left.squareScore || 0) * 10000 + (left.cornerScore || 0) * 1200 + Math.sqrt(left.area || 0);
+    const rightScore = (right.squareScore || 0) * 10000 + (right.cornerScore || 0) * 1200 + Math.sqrt(right.area || 0);
+    return rightScore - leftScore;
+  });
+
+  const unique = [];
+  for (const candidate of candidates) {
+    const duplicate = unique.some((item) => distance(item.center, candidate.center) < 18);
+    if (!duplicate) {
+      unique.push(candidate);
+    }
+    if (unique.length >= 20) {
+      break;
+    }
+  }
+
+  if (unique.length < 4) {
+    return [];
+  }
+
+  let best = null;
+  const limit = Math.min(unique.length, 14);
+  for (let a = 0; a < limit - 3; a += 1) {
+    for (let b = a + 1; b < limit - 2; b += 1) {
+      for (let c = b + 1; c < limit - 1; c += 1) {
+        for (let d = c + 1; d < limit; d += 1) {
+          const combo = [unique[a], unique[b], unique[c], unique[d]];
+
+          const centers = combo.map((item) => item.center);
+          let minDist = Infinity;
+          for (let i = 0; i < centers.length; i += 1) {
+            for (let j = i + 1; j < centers.length; j += 1) {
+              minDist = Math.min(minDist, distance(centers[i], centers[j]));
+            }
+          }
+          if (minDist < Math.min(width, height) * 0.06) {
+            continue;
+          }
+
+          const ordered = orderCorners(combo.map((item) => item.center));
+          const rectScore = rectangleScore(ordered, width, height);
+          const cornerBoost =
+            (combo.reduce((sum, item) => sum + (item.cornerScore || 0), 0) / 4) * MARKER_CORNER_BONUS;
+          const squareBoost = combo.reduce((sum, item) => sum + (item.squareScore || 0), 0) / 4;
+          const score = rectScore * (1 + cornerBoost) * (0.55 + (squareBoost * 0.45));
+          if (!best || score > best.score) {
+            best = { score, markers: combo };
+          }
+        }
+      }
+    }
+  }
+
+  return best ? best.markers : unique.slice(0, 4);
+}
+
 function rectangleScore(points, frameWidth, frameHeight) {
   const [topLeft, topRight, bottomRight, bottomLeft] = points;
   const widthTop = distance(topLeft, topRight);
@@ -1132,7 +1395,13 @@ function rectangleScore(points, frameWidth, frameHeight) {
   const heightBalance = 1 - Math.abs(heightLeft - heightRight) / Math.max(heightLeft, heightRight, 1);
   const areaScore = ((widthTop + widthBottom) / 2) * ((heightLeft + heightRight) / 2);
   const normalizedArea = areaScore / Math.max(frameWidth * frameHeight, 1);
-  return normalizedArea * widthBalance * heightBalance;
+
+  // Penaliza quadriláteros com proporção muito diferente do cartão.
+  const quadAspect = ((widthTop + widthBottom) / 2) / Math.max((heightLeft + heightRight) / 2, 1);
+  const aspectError = Math.abs(quadAspect - CARD_ASPECT) / Math.max(CARD_ASPECT, 1e-6);
+  const aspectScore = clamp(1 - aspectError, 0, 1);
+
+  return normalizedArea * widthBalance * heightBalance * (0.35 + (aspectScore * 0.65));
 }
 
 function perspectiveWarp(grayMat, corners) {
@@ -1560,15 +1829,36 @@ async function captureAndProcessPhoto() {
   setWorkflowState("answerScanning", "Processando foto…");
   updateCardControls();
 
-  let detection = null;
+  let detection;
   try {
     detection = detectCardAnswersFromCanvas(processingCanvas, state.proof.quantidade_questoes);
-  } catch (error) {
-    detection = null;
+  } catch {
+    detection = { ok: false, reason: "unknown" };
   }
 
-  if (!detection) {
-    setWorkflowState("error", "Não foi possível identificar os 4 marcadores. Alinhe melhor e tire outra foto.");
+  if (!detection || detection.ok === false) {
+    const reason = detection?.reason || "unknown";
+    if (reason === "markers_not_found") {
+      setWorkflowState(
+        "error",
+        "Não foi possível identificar os quatro quadradinhos de alinhamento. Tire uma nova foto com o cartão inteiro visível e boa iluminação.",
+      );
+    } else if (reason === "bad_geometry") {
+      setWorkflowState(
+        "error",
+        "Os marcadores foram encontrados, mas o cartão está muito inclinado ou parcialmente fora da imagem. Tire uma nova foto.",
+      );
+    } else if (reason === "blur") {
+      setWorkflowState(
+        "error",
+        "A foto ficou desfocada. Afaste um pouco o celular, estabilize e tire uma nova foto com boa iluminação.",
+      );
+    } else {
+      setWorkflowState(
+        "error",
+        "Não foi possível ler o cartão com confiança. Alinhe melhor e tire uma nova foto.",
+      );
+    }
     updateCardControls();
     return;
   }
@@ -1586,6 +1876,7 @@ function retakePhoto() {
   resetReadingUi();
   setWorkflowState("waitingUserToStartAnswerScan", "Toque em “Habilitar câmera” e alinhe o cartão.");
   updateCardControls();
+  enableAnswerCamera();
 }
 
 function confirmReading() {
