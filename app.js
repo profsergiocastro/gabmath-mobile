@@ -931,6 +931,19 @@ function drawMarkerSelectionDebug(imageData, markers) {
     context.arc(x, y, 16, 0, Math.PI * 2);
     context.stroke();
   }
+
+  if (markers.length === 4) {
+    const corners = orderCorners(markers.map((marker) => marker.center));
+    context.strokeStyle = "#ff3d00";
+    context.lineWidth = 4;
+    context.beginPath();
+    context.moveTo(corners[0].x, corners[0].y);
+    context.lineTo(corners[1].x, corners[1].y);
+    context.lineTo(corners[2].x, corners[2].y);
+    context.lineTo(corners[3].x, corners[3].y);
+    context.closePath();
+    context.stroke();
+  }
 }
 
 function findMarkers(binaryMat, width, height) {
@@ -958,7 +971,7 @@ function findMarkersV2(binaryMat, width, height) {
 }
 
 function findMarkersMultiScale(grayMat) {
-  const scales = [1.0, 0.8, 0.62, 0.48];
+  const scales = [1.0, 0.85, 0.7, 0.55, 0.42, 0.34];
   const candidates = [];
 
   for (const scale of scales) {
@@ -977,14 +990,26 @@ function findMarkersMultiScale(grayMat) {
       }
 
       cv.GaussianBlur(scaled, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
-      cv.threshold(blur, thresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
-      if (state.opencvKernel) {
-        cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
-      }
 
-      let markers = findMarkersV2(thresh, scaled.cols, scaled.rows);
-      if (markers.length < 4) {
-        markers = findMarkers(thresh, scaled.cols, scaled.rows);
+      const thresholdAttempts = [
+        () => cv.threshold(blur, thresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU),
+        () => cv.adaptiveThreshold(blur, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 31, 7),
+        () => cv.adaptiveThreshold(blur, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 51, 9),
+      ];
+
+      let markers = [];
+      for (const applyThreshold of thresholdAttempts) {
+        applyThreshold();
+        if (state.opencvKernel) {
+          cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
+        }
+        markers = findMarkersV2(thresh, scaled.cols, scaled.rows);
+        if (markers.length < 4) {
+          markers = findMarkers(thresh, scaled.cols, scaled.rows);
+        }
+        if (markers.length >= 4) {
+          break;
+        }
       }
 
       for (const marker of markers) {
@@ -1472,6 +1497,10 @@ function readAnswersFromWarped(warpedGray, questionCount) {
     const markedIndices = resolveMarkedIndices(scores);
     const selectedIndex = markedIndices.length === 1 ? markedIndices[0] : -1;
     const letter = selectedIndex >= 0 ? ["A", "B", "C", "D", "E"][selectedIndex] : "";
+    const status = markedIndices.length === 0
+      ? "em_branco"
+      : (markedIndices.length === 1 ? "respondida" : "multipla_marcacao");
+    const markedLetters = markedIndices.map((index) => ["A", "B", "C", "D", "E"][index] || "?");
 
     if (letter) {
       answers[String(questionIndex)] = letter;
@@ -1481,8 +1510,10 @@ function readAnswersFromWarped(warpedGray, questionCount) {
       questionNumber: questionIndex,
       centers,
       markedIndices,
+      markedLetters,
       selectedIndex,
       bubbleRadius,
+      status,
     });
   }
 
@@ -1521,21 +1552,27 @@ function readAnswersFromWarpedV2(warpedGray, questionCount) {
         scores.push(sampleBubbleContrastScore(warpedGray, centerX, centerY, roiSize, innerMask, ringMask));
       }
 
-      const { markedIndices, selectedIndex, confidence, adaptiveThreshold } = classifyBubbleScores(scores);
-      const letter = selectedIndex >= 0 ? ["A", "B", "C", "D", "E"][selectedIndex] : "";
+      const classification = classifyBubbleScores(scores);
+      const { markedIndices, selectedIndex, confidence, adaptiveThreshold, status } = classification;
+      const letter = status === "respondida" && selectedIndex >= 0
+        ? ["A", "B", "C", "D", "E"][selectedIndex]
+        : "";
       if (letter) {
         answers[String(questionIndex)] = letter;
       }
+      const markedLetters = markedIndices.map((index) => ["A", "B", "C", "D", "E"][index] || "?");
 
       rows.push({
         questionNumber: questionIndex,
         centers,
         scores,
         markedIndices,
+        markedLetters,
         selectedIndex,
         bubbleRadius,
         confidence,
         adaptiveThreshold,
+        status,
       });
     }
   } finally {
@@ -1573,7 +1610,7 @@ function classifyBubbleScores(scores) {
     .map((score, index) => ({ score, index }))
     .sort((a, b) => b.score - a.score);
 
-  const best = sorted[0];
+  const best = sorted[0] || { score: 0, index: -1 };
   const second = sorted[1] || { score: 0, index: -1 };
 
   const mean = scores.reduce((sum, value) => sum + value, 0) / Math.max(scores.length, 1);
@@ -1581,22 +1618,29 @@ function classifyBubbleScores(scores) {
   const std = Math.sqrt(variance);
 
   const adaptiveThreshold = Math.max(BUBBLE_CONTRAST_MIN, mean + (std * 0.75));
-  if (best.score < adaptiveThreshold) {
-    return { markedIndices: [], selectedIndex: -1, confidence: 0, adaptiveThreshold };
+  const markedIndices = scores
+    .map((score, index) => ({ score, index }))
+    .filter((item) => item.score >= adaptiveThreshold)
+    .map((item) => item.index);
+
+  // Regras pedagógicas: nunca "forçar" resposta.
+  if (markedIndices.length === 0) {
+    return { status: "em_branco", markedIndices: [], selectedIndex: -1, confidence: 0, adaptiveThreshold };
   }
 
+  // Se mais de uma alternativa passou do limiar, é múltipla marcação (errada).
+  if (markedIndices.length >= 2) {
+    const confidence = clamp(best.score - second.score, 0, 1);
+    return { status: "multipla_marcacao", markedIndices, selectedIndex: -1, confidence, adaptiveThreshold };
+  }
+
+  // Apenas uma acima do limiar: ainda pode ser ambígua se muito próxima da segunda.
   const relativeAmbiguous = second.score >= best.score * BUBBLE_AMBIGUOUS_RELATIVE;
   const gapAmbiguous = (best.score - second.score) <= BUBBLE_AMBIGUOUS_GAP;
-  const ambiguous = relativeAmbiguous || gapAmbiguous;
-
-  if (ambiguous) {
-    const threshold = Math.max(adaptiveThreshold, best.score * 0.92);
-    const markedIndices = scores
-      .map((score, index) => ({ score, index }))
-      .filter((item) => item.score >= threshold)
-      .map((item) => item.index);
+  if (relativeAmbiguous || gapAmbiguous) {
     return {
-      markedIndices,
+      status: "ambigua",
+      markedIndices: [best.index, second.index].filter((value) => value >= 0),
       selectedIndex: -1,
       confidence: clamp(best.score - second.score, 0, 1),
       adaptiveThreshold,
@@ -1604,6 +1648,7 @@ function classifyBubbleScores(scores) {
   }
 
   return {
+    status: "respondida",
     markedIndices: [best.index],
     selectedIndex: best.index,
     confidence: clamp(best.score - second.score, 0, 1),
@@ -1759,7 +1804,7 @@ function drawCircle(context, center, radius, color) {
 }
 
 function correctProof() {
-  const result = correctProofLocally(state.proof, state.answers);
+  const result = correctProofLocally(state.proof, state.answers, state.lastDetection?.rows || []);
   drawCorrectionPreview(result);
   state.elements.resultPanel.classList.remove("hidden");
   state.elements.resultPanel.classList.toggle("wrong", result.acertos !== result.total);
@@ -1767,8 +1812,35 @@ function correctProof() {
     <div><strong>Aluno:</strong> ${escapeHtml(result.aluno || "")}</div>
     <div><strong>Acertos:</strong> ${result.acertos} de ${result.total}</div>
     <div><strong>Nota:</strong> ${result.nota}</div>
+    <div><strong>Em branco:</strong> ${result.brancos}</div>
+    <div><strong>Múltiplas:</strong> ${result.multiplas}</div>
+    <div><strong>Ambíguas:</strong> ${result.ambiguas}</div>
     <div><strong>Legenda:</strong> verde = correta, vermelho = errada.</div>
   `;
+
+  if (state.debug) {
+    const debugPayload = result.detalhes.map((item) => ({
+      numero: item.numero,
+      status: item.status,
+      marcada: item.marcada,
+      marcadas: item.marcadas,
+      correta: item.correta,
+      acertou: item.acertou,
+      scores: item.scores,
+      threshold: item.threshold,
+    }));
+    const details = document.createElement("details");
+    details.style.marginTop = "10px";
+    const summary = document.createElement("summary");
+    summary.textContent = "Debug (scores por questão)";
+    const pre = document.createElement("pre");
+    pre.style.whiteSpace = "pre-wrap";
+    pre.style.fontSize = "0.85rem";
+    pre.textContent = JSON.stringify(debugPayload, null, 2);
+    details.appendChild(summary);
+    details.appendChild(pre);
+    state.elements.resultPanel.appendChild(details);
+  }
   setStatus("Leitura concluída.");
 }
 
@@ -1891,21 +1963,46 @@ function cancelReading() {
   updateCardControls();
 }
 
-function correctProofLocally(proof, answers) {
+function correctProofLocally(proof, answers, rows) {
   const details = [];
   let correct = 0;
+  let brancos = 0;
+  let multiplas = 0;
+  let ambiguas = 0;
+
+  const rowByNumber = new Map();
+  for (const row of rows || []) {
+    rowByNumber.set(Number(row.questionNumber), row);
+  }
   for (const question of proof.questoes || []) {
-    const marked = String(answers[String(question.numero)] || "").toUpperCase();
+    const row = rowByNumber.get(Number(question.numero));
+    const status = row?.status || (answers[String(question.numero)] ? "respondida" : "em_branco");
+
+    let marked = "";
+    if (status === "respondida") {
+      marked = String(answers[String(question.numero)] || "").toUpperCase();
+    }
     const expected = String(question.correta_letra || "").toUpperCase();
-    const hit = marked !== "" && marked === expected;
+    const hit = status === "respondida" && marked !== "" && marked === expected;
     if (hit) {
       correct += 1;
+    }
+    if (status === "em_branco") {
+      brancos += 1;
+    } else if (status === "multipla_marcacao") {
+      multiplas += 1;
+    } else if (status === "ambigua") {
+      ambiguas += 1;
     }
     details.push({
       numero: question.numero,
       marcada: marked,
+      marcadas: row?.markedLetters || [],
       correta: expected,
       acertou: hit,
+      status,
+      scores: row?.scores || [],
+      threshold: row?.adaptiveThreshold ?? null,
     });
   }
   const total = details.length;
@@ -1914,6 +2011,9 @@ function correctProofLocally(proof, answers) {
     acertos: correct,
     total,
     nota: total ? Math.round((correct / total) * 1000) / 100 : 0,
+    brancos,
+    multiplas,
+    ambiguas,
     detalhes: details,
   };
 }
