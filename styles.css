@@ -76,6 +76,7 @@ h2 {
   border-radius: 16px;
   overflow: hidden;
   background: #0f2235;
+  margin-top: 12px;
 }
 
 #camera-video,

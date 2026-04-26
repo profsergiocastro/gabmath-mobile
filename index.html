@@ -16,12 +16,13 @@
         <span id="mode-badge" class="mode-badge">Lendo QR</span>
       </div>
 
+      <div id="camera-panel" class="camera-stack hidden">
+        <video id="camera-video" playsinline muted></video>
+        <canvas id="camera-overlay"></canvas>
+      </div>
+
       <div id="step-qr" class="step">
         <h2>Leitura do QR</h2>
-        <div class="camera-stack">
-          <video id="camera-video" playsinline muted></video>
-          <canvas id="camera-overlay"></canvas>
-        </div>
         <div class="actions">
           <button id="start-scan">Iniciar câmera</button>
           <button id="stop-scan" class="secondary">Parar</button>
@@ -37,10 +38,12 @@
       <div id="step-card" class="step hidden">
         <h2>Cartão-resposta</h2>
         <div id="proof-summary" class="summary"></div>
-        <p class="hint">Mantenha visíveis os quatro quadrados pretos. A leitura só será aceita quando a imagem estiver alinhada e nítida.</p>
-        <div class="actions">
-          <button id="start-card-scan" class="full">Iniciar leitura do cartão</button>
-          <button id="stop-card" class="secondary full">Parar</button>
+        <p class="hint">Alinhe o celular com o cartão-resposta e toque em “Habilitar câmera”. Depois, quando estiver enquadrado, toque em “Iniciar leitura”.</p>
+        <div class="actions single-column">
+          <button id="enable-camera" class="full">Habilitar câmera</button>
+          <button id="start-reading" class="full hidden">Iniciar leitura</button>
+          <button id="stop-reading" class="secondary full hidden">Parar leitura</button>
+          <button id="disable-camera" class="secondary full hidden">Desabilitar câmera</button>
         </div>
         <label class="debug-toggle">
           <input id="debug-toggle" type="checkbox">

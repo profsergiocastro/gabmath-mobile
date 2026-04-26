@@ -68,6 +68,7 @@ function initializeQrPage() {
     modeBadge: document.getElementById("mode-badge"),
     video: document.getElementById("camera-video"),
     overlayCanvas: document.getElementById("camera-overlay"),
+    cameraPanel: document.getElementById("camera-panel") || document.querySelector(".camera-stack"),
     startScanButton: document.getElementById("start-scan"),
     stopScanButton: document.getElementById("stop-scan"),
     loadProofButton: document.getElementById("load-proof"),
@@ -76,31 +77,24 @@ function initializeQrPage() {
     cardStatus: document.getElementById("card-status"),
     qrStep: document.getElementById("step-qr"),
     cardStep: document.getElementById("step-card"),
-    startCardScanButton: document.getElementById("start-card-scan"),
+    enableCameraButton: document.getElementById("enable-camera"),
+    startReadingButton: document.getElementById("start-reading"),
+    stopReadingButton: document.getElementById("stop-reading"),
+    disableCameraButton: document.getElementById("disable-camera"),
     proofSummary: document.getElementById("proof-summary"),
     answerGrid: document.getElementById("answer-grid"),
     resultPanel: document.getElementById("result-panel"),
     alignedCanvas: document.getElementById("aligned-preview"),
     backToQrButton: document.getElementById("back-to-qr"),
-    stopCardButton: document.getElementById("stop-card"),
     debugToggle: document.getElementById("debug-toggle"),
   };
 
   state.elements.startScanButton.addEventListener("click", startQrCamera);
   state.elements.stopScanButton.addEventListener("click", stopWorkflow);
   state.elements.loadProofButton.addEventListener("click", () => commitQrAndGo(state.elements.proofIdInput.value));
-  if (state.elements.startCardScanButton) {
-    state.elements.startCardScanButton.addEventListener("click", startAnswerScan);
-  }
+  wireCardButtons();
   if (state.elements.backToQrButton) {
     state.elements.backToQrButton.addEventListener("click", backToQrMode);
-  }
-  if (state.elements.stopCardButton) {
-    state.elements.stopCardButton.addEventListener("click", () => {
-      stopAnswerCamera();
-      setWorkflowState("waitingUserToStartAnswerScan", "Leitura interrompida. Alinhe e toque em “Iniciar leitura”.");
-      updateCardControls();
-    });
   }
 
   waitForOpenCv();
@@ -130,10 +124,15 @@ function initializeCardPage() {
     modeBadge: document.getElementById("mode-badge"),
     video: document.getElementById("camera-video"),
     overlayCanvas: document.getElementById("camera-overlay"),
+    cameraPanel: document.getElementById("camera-panel") || document.querySelector(".camera-stack"),
     alignedCanvas: document.getElementById("aligned-preview"),
     startScanButton: document.getElementById("start-scan"),
     stopScanButton: document.getElementById("stop-scan"),
     startCardScanButton: document.getElementById("start-card-scan"),
+    enableCameraButton: document.getElementById("enable-camera"),
+    startReadingButton: document.getElementById("start-reading"),
+    stopReadingButton: document.getElementById("stop-reading"),
+    disableCameraButton: document.getElementById("disable-camera"),
     proofSummary: document.getElementById("proof-summary"),
     scanStatus: document.getElementById("scan-status"),
     answerGrid: document.getElementById("answer-grid"),
@@ -141,9 +140,7 @@ function initializeCardPage() {
     debugToggle: document.getElementById("debug-toggle"),
   };
 
-  state.elements.startScanButton.addEventListener("click", startAnswerScan);
-  state.elements.stopScanButton.addEventListener("click", stopWorkflow);
-  state.elements.startCardScanButton.addEventListener("click", startAnswerScan);
+  wireCardButtons();
 
   waitForOpenCv();
   state.debug = Boolean(getQueryFlag("debug")) || Boolean(state.elements.debugToggle?.checked);
@@ -162,7 +159,9 @@ function initializeCardPage() {
   state.proof = JSON.parse(stored);
   renderProofSummary();
   renderAnswerGrid();
-  setStatus("Abra a camera e depois alinhe o cartao-resposta com calma.");
+  setWorkflowState("waitingUserToStartAnswerScan");
+  updateCardControls();
+  setStatus("Alinhe o celular com o cartão-resposta e toque em “Habilitar câmera”.");
 }
 
 async function startQrCamera() {
@@ -172,6 +171,7 @@ async function startQrCamera() {
     setWorkflowState("error", "Falha ao abrir a câmera.");
     return;
   }
+  setCameraPanelVisible(true);
   setStatus("Câmera aberta. Aponte apenas para o QR Code.");
   startQrLoop();
 }
@@ -182,6 +182,7 @@ async function startCardCamera() {
     setWorkflowState("error", "Falha ao abrir a câmera.");
     return;
   }
+  setCameraPanelVisible(true);
   setWorkflowState("waitingUserToStartAnswerScan", "Câmera aberta. Alinhe o cartão e toque em “Iniciar leitura”.");
   updateCardControls();
 }
@@ -266,12 +267,14 @@ function stopQrCamera() {
   state.qrProcessing = false;
   disposeCameraResources();
   clearOverlay();
+  setCameraPanelVisible(false);
 }
 
 function stopAnswerCamera() {
   stopLoops();
   disposeCameraResources();
   clearOverlay();
+  setCameraPanelVisible(false);
 }
 
 function stopLoops() {
@@ -329,6 +332,7 @@ function enterCardMode(proof, { autoStart } = { autoStart: false }) {
 
   // Ao sair do QR, sempre libera a câmera e espera o usuário iniciar.
   stopQrCamera();
+  setCameraPanelVisible(false);
 
   if (state.elements.qrStep) {
     state.elements.qrStep.classList.add("hidden");
@@ -360,6 +364,7 @@ function backToQrMode() {
   state.autoStartCardReading = false;
   stopLoops();
   stopAnswerCamera();
+  setCameraPanelVisible(false);
   state.proof = null;
   state.answers = {};
   state.stableSignature = "";
@@ -375,6 +380,7 @@ function backToQrMode() {
   }
   setBadge("Lendo QR");
   setWorkflowState("idle", "Aponte a câmera apenas para o QR Code.");
+  updateCardControls();
 }
 
 async function detectQrCode(videoElement) {
@@ -455,6 +461,37 @@ function drawQrGuide() {
   context.fillRect(0, y + boxH, width, height - (y + boxH));
   context.fillRect(0, y, x, boxH);
   context.fillRect(x + boxW, y, width - (x + boxW), boxH);
+}
+
+function setCameraPanelVisible(visible) {
+  const panel = state.elements?.cameraPanel;
+  if (!panel) {
+    return;
+  }
+  panel.classList.toggle("hidden", !visible);
+}
+
+function drawAnswerGuide() {
+  if (!state.elements?.overlayCanvas || !state.elements?.video) {
+    return;
+  }
+  const width = state.elements.video.clientWidth || state.elements.video.videoWidth || 1;
+  const height = state.elements.video.clientHeight || state.elements.video.videoHeight || 1;
+  state.elements.overlayCanvas.width = width;
+  state.elements.overlayCanvas.height = height;
+  const context = state.elements.overlayCanvas.getContext("2d");
+  context.clearRect(0, 0, width, height);
+
+  const boxW = Math.round(width * 0.9);
+  const boxH = Math.round(height * 0.7);
+  const x = Math.round((width - boxW) / 2);
+  const y = Math.round((height - boxH) / 2);
+
+  context.strokeStyle = "rgba(52,199,89,0.92)";
+  context.lineWidth = 4;
+  context.setLineDash([12, 10]);
+  context.strokeRect(x, y, boxW, boxH);
+  context.setLineDash([]);
 }
 
 function commitQrAndGo(rawValue) {
@@ -634,6 +671,70 @@ function startCardReading() {
   };
 
   state.cardTimer = requestAnimationFrame(tick);
+}
+
+function stopAnswerReading() {
+  stopLoops();
+  clearOverlay();
+  setWorkflowState("waitingUserToStartAnswerScan", "Leitura pausada. Reenquadre e toque em “Iniciar leitura”.");
+  updateCardControls();
+}
+
+function disableAnswerCamera() {
+  stopAnswerReading();
+  stopAnswerCamera();
+  setWorkflowState("waitingUserToStartAnswerScan", "Câmera desabilitada. Toque em “Habilitar câmera”.");
+  updateCardControls();
+}
+
+async function enableAnswerCamera() {
+  if (state.stream) {
+    setCameraPanelVisible(true);
+    setWorkflowState("waitingUserToStartAnswerScan");
+    updateCardControls();
+    return;
+  }
+  await startCardCamera();
+}
+
+function wireCardButtons() {
+  if (!state.elements) {
+    return;
+  }
+
+  // Novo layout (index.html atualizado)
+  if (state.elements.enableCameraButton && !state.elements.enableCameraButton.dataset.wired) {
+    state.elements.enableCameraButton.dataset.wired = "1";
+    state.elements.enableCameraButton.addEventListener("click", enableAnswerCamera);
+  }
+  if (state.elements.startReadingButton && !state.elements.startReadingButton.dataset.wired) {
+    state.elements.startReadingButton.dataset.wired = "1";
+    state.elements.startReadingButton.addEventListener("click", () => startCardReading());
+  }
+  if (state.elements.stopReadingButton && !state.elements.stopReadingButton.dataset.wired) {
+    state.elements.stopReadingButton.dataset.wired = "1";
+    state.elements.stopReadingButton.addEventListener("click", stopAnswerReading);
+  }
+  if (state.elements.disableCameraButton && !state.elements.disableCameraButton.dataset.wired) {
+    state.elements.disableCameraButton.dataset.wired = "1";
+    state.elements.disableCameraButton.addEventListener("click", disableAnswerCamera);
+  }
+
+  // Compatibilidade com card.html antigo (se existir).
+  if (state.elements.startScanButton && state.elements.stopScanButton && state.elements.startCardScanButton) {
+    if (!state.elements.startScanButton.dataset.wired) {
+      state.elements.startScanButton.dataset.wired = "1";
+      state.elements.startScanButton.addEventListener("click", startCardCamera);
+    }
+    if (!state.elements.stopScanButton.dataset.wired) {
+      state.elements.stopScanButton.dataset.wired = "1";
+      state.elements.stopScanButton.addEventListener("click", stopWorkflow);
+    }
+    if (!state.elements.startCardScanButton.dataset.wired) {
+      state.elements.startCardScanButton.dataset.wired = "1";
+      state.elements.startCardScanButton.addEventListener("click", () => startCardReading());
+    }
+  }
 }
 
 function detectCardAnswers(videoElement, questionCount) {
@@ -1461,26 +1562,48 @@ function setWorkflowState(next, statusText) {
 }
 
 function updateCardControls() {
-  if (!state.elements?.startCardScanButton) {
-    return;
-  }
-  const button = state.elements.startCardScanButton;
   if (!state.cardMode) {
+    setCameraPanelVisible(state.workflow === "qrScanning");
     return;
   }
 
-  if (state.workflow === "answerScanning") {
-    button.disabled = true;
-    button.textContent = "Lendo…";
+  const cameraEnabled = Boolean(state.stream && state.elements.video?.srcObject);
+  const scanning = state.workflow === "answerScanning";
+
+  setCameraPanelVisible(cameraEnabled);
+
+  // Novo layout (index.html atualizado)
+  if (state.elements?.enableCameraButton) {
+    state.elements.enableCameraButton.classList.toggle("hidden", cameraEnabled);
+    state.elements.enableCameraButton.disabled = scanning;
+
+    if (state.elements.startReadingButton) {
+      state.elements.startReadingButton.classList.toggle("hidden", !cameraEnabled || scanning);
+      state.elements.startReadingButton.disabled = !state.opencvReady || scanning;
+    }
+
+    if (state.elements.stopReadingButton) {
+      state.elements.stopReadingButton.classList.toggle("hidden", !scanning);
+      state.elements.stopReadingButton.disabled = !scanning;
+    }
+
+    if (state.elements.disableCameraButton) {
+      state.elements.disableCameraButton.classList.toggle("hidden", !cameraEnabled);
+      state.elements.disableCameraButton.disabled = scanning;
+    }
+
+    if (cameraEnabled && !scanning) {
+      drawAnswerGuide();
+    }
     return;
   }
 
-  button.disabled = !state.opencvReady || !state.proof;
-  if (!state.opencvReady) {
-    button.textContent = "Aguarde o OpenCV…";
-    return;
+  // Compatibilidade: card.html antigo.
+  if (state.elements?.startScanButton && state.elements?.stopScanButton && state.elements?.startCardScanButton) {
+    state.elements.startScanButton.disabled = scanning;
+    state.elements.stopScanButton.disabled = false;
+    state.elements.startCardScanButton.disabled = !cameraEnabled || !state.opencvReady || scanning;
   }
-  button.textContent = state.stream ? "Iniciar leitura" : "Habilitar câmera";
 }
 
 async function startAnswerScan() {
