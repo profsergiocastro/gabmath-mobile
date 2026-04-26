@@ -78,8 +78,10 @@ function initializeQrPage() {
     qrStep: document.getElementById("step-qr"),
     cardStep: document.getElementById("step-card"),
     enableCameraButton: document.getElementById("enable-camera"),
-    startReadingButton: document.getElementById("start-reading"),
-    stopReadingButton: document.getElementById("stop-reading"),
+    capturePhotoButton: document.getElementById("capture-photo"),
+    retakePhotoButton: document.getElementById("retake-photo"),
+    confirmReadingButton: document.getElementById("confirm-reading"),
+    cancelReadingButton: document.getElementById("cancel-reading"),
     disableCameraButton: document.getElementById("disable-camera"),
     proofSummary: document.getElementById("proof-summary"),
     answerGrid: document.getElementById("answer-grid"),
@@ -130,8 +132,10 @@ function initializeCardPage() {
     stopScanButton: document.getElementById("stop-scan"),
     startCardScanButton: document.getElementById("start-card-scan"),
     enableCameraButton: document.getElementById("enable-camera"),
-    startReadingButton: document.getElementById("start-reading"),
-    stopReadingButton: document.getElementById("stop-reading"),
+    capturePhotoButton: document.getElementById("capture-photo"),
+    retakePhotoButton: document.getElementById("retake-photo"),
+    confirmReadingButton: document.getElementById("confirm-reading"),
+    cancelReadingButton: document.getElementById("cancel-reading"),
     disableCameraButton: document.getElementById("disable-camera"),
     proofSummary: document.getElementById("proof-summary"),
     scanStatus: document.getElementById("scan-status"),
@@ -482,8 +486,14 @@ function drawAnswerGuide() {
   const context = state.elements.overlayCanvas.getContext("2d");
   context.clearRect(0, 0, width, height);
 
-  const boxW = Math.round(width * 0.9);
-  const boxH = Math.round(height * 0.7);
+  // Proporção aproximada do cartão (CARD_TARGET.width / CARD_TARGET.height)
+  const targetAspect = CARD_TARGET.width / CARD_TARGET.height;
+  let boxW = Math.round(width * 0.92);
+  let boxH = Math.round(boxW / Math.max(targetAspect, 0.01));
+  if (boxH > Math.round(height * 0.78)) {
+    boxH = Math.round(height * 0.78);
+    boxW = Math.round(boxH * targetAspect);
+  }
   const x = Math.round((width - boxW) / 2);
   const y = Math.round((height - boxH) / 2);
 
@@ -492,6 +502,41 @@ function drawAnswerGuide() {
   context.setLineDash([12, 10]);
   context.strokeRect(x, y, boxW, boxH);
   context.setLineDash([]);
+
+  // Marcação dos 4 cantos (onde os quadrados pretos devem ficar).
+  const cornerSize = Math.max(18, Math.round(Math.min(boxW, boxH) * 0.08));
+  const inset = Math.max(10, Math.round(cornerSize * 0.25));
+  context.lineWidth = 5;
+  context.strokeStyle = "rgba(52,199,89,0.95)";
+
+  drawCorner(context, x + inset, y + inset, cornerSize, "tl");
+  drawCorner(context, x + boxW - inset, y + inset, cornerSize, "tr");
+  drawCorner(context, x + boxW - inset, y + boxH - inset, cornerSize, "br");
+  drawCorner(context, x + inset, y + boxH - inset, cornerSize, "bl");
+}
+
+function drawCorner(context, x, y, size, where) {
+  const half = Math.round(size / 2);
+  const len = Math.round(size * 0.7);
+  context.beginPath();
+  if (where === "tl") {
+    context.moveTo(x, y + len);
+    context.lineTo(x, y);
+    context.lineTo(x + len, y);
+  } else if (where === "tr") {
+    context.moveTo(x - len, y);
+    context.lineTo(x, y);
+    context.lineTo(x, y + len);
+  } else if (where === "br") {
+    context.moveTo(x, y - len);
+    context.lineTo(x, y);
+    context.lineTo(x - len, y);
+  } else {
+    context.moveTo(x + len, y);
+    context.lineTo(x, y);
+    context.lineTo(x, y - len);
+  }
+  context.stroke();
 }
 
 function commitQrAndGo(rawValue) {
@@ -587,96 +632,15 @@ function updateRenderedAnswers() {
 }
 
 function startCardReading() {
-  if (!state.proof) {
-    setStatus("Nenhuma prova carregada.");
-    return;
-  }
-  if (!state.stream || !state.elements.video?.srcObject) {
-    setStatus("Abra a câmera antes de iniciar a leitura do cartão.");
-    return;
-  }
-  if (!state.opencvReady) {
-    setStatus("OpenCV ainda esta carregando.");
-    return;
-  }
-
-  setWorkflowState("answerScanning");
-  updateCardControls();
-  state.answers = {};
-  state.stableSignature = "";
-  state.stableCount = 0;
-  state.lastDetection = null;
-  state.elements.resultPanel.classList.add("hidden");
-  state.elements.resultPanel.innerHTML = "";
-  clearOverlay();
-  stopLoops();
-
-  setStatus("Alinhe os 4 quadrados pretos. A leitura só fecha quando a imagem estiver nítida.");
-
-  let lastTimestamp = 0;
-  const tick = (timestamp) => {
-    if (!state.elements.video?.srcObject) {
-      state.cardTimer = requestAnimationFrame(tick);
-      return;
-    }
-
-    if (timestamp - lastTimestamp < CARD_FRAME_INTERVAL_MS) {
-      state.cardTimer = requestAnimationFrame(tick);
-      return;
-    }
-    lastTimestamp = timestamp;
-
-    const detection = detectCardAnswers(state.elements.video, state.proof.quantidade_questoes);
-    if (!detection) {
-      state.stableSignature = "";
-      state.stableCount = 0;
-      setStatus("Nao foi possivel alinhar o cartao. Mantenha visiveis os 4 quadrados pretos.");
-      state.cardTimer = requestAnimationFrame(tick);
-      return;
-    }
-
-    state.lastDetection = detection;
-    drawOverlay(detection.corners);
-    drawAlignedPreview(detection.baseImageData);
-
-    if (detection.focusScore < MIN_FOCUS_SCORE) {
-      state.stableSignature = "";
-      state.stableCount = 0;
-      setStatus(`Imagem ainda sem nitidez suficiente (${Math.round(detection.focusScore)}). Aproxime e estabilize o celular.`);
-      state.cardTimer = requestAnimationFrame(tick);
-      return;
-    }
-
-    const signature = answersSignature(detection.answers, state.proof.quantidade_questoes);
-    if (signature === state.stableSignature) {
-      state.stableCount += 1;
-    } else {
-      state.stableSignature = signature;
-      state.stableCount = 1;
-    }
-
-    state.answers = { ...detection.answers };
-    updateRenderedAnswers();
-    setStatus(`Cartao alinhado e nitido. Confirmando leitura... ${state.stableCount}/${REQUIRED_STABLE_FRAMES}`);
-
-    if (state.stableCount >= REQUIRED_STABLE_FRAMES) {
-      stopAnswerCamera();
-      correctProof();
-      setWorkflowState("answerDetected");
-      updateCardControls();
-      return;
-    }
-
-    state.cardTimer = requestAnimationFrame(tick);
-  };
-
-  state.cardTimer = requestAnimationFrame(tick);
+  // Fluxo antigo (tempo real) foi substituído por captura de foto.
+  setStatus("Use o botão “Capturar foto” para fazer a leitura.");
 }
 
 function stopAnswerReading() {
+  // No modo por foto, não há leitura contínua. Mantém por compatibilidade.
   stopLoops();
   clearOverlay();
-  setWorkflowState("waitingUserToStartAnswerScan", "Leitura pausada. Reenquadre e toque em “Iniciar leitura”.");
+  setWorkflowState("waitingUserToStartAnswerScan", "Leitura pausada.");
   updateCardControls();
 }
 
@@ -707,13 +671,21 @@ function wireCardButtons() {
     state.elements.enableCameraButton.dataset.wired = "1";
     state.elements.enableCameraButton.addEventListener("click", enableAnswerCamera);
   }
-  if (state.elements.startReadingButton && !state.elements.startReadingButton.dataset.wired) {
-    state.elements.startReadingButton.dataset.wired = "1";
-    state.elements.startReadingButton.addEventListener("click", () => startCardReading());
+  if (state.elements.capturePhotoButton && !state.elements.capturePhotoButton.dataset.wired) {
+    state.elements.capturePhotoButton.dataset.wired = "1";
+    state.elements.capturePhotoButton.addEventListener("click", captureAndProcessPhoto);
   }
-  if (state.elements.stopReadingButton && !state.elements.stopReadingButton.dataset.wired) {
-    state.elements.stopReadingButton.dataset.wired = "1";
-    state.elements.stopReadingButton.addEventListener("click", stopAnswerReading);
+  if (state.elements.retakePhotoButton && !state.elements.retakePhotoButton.dataset.wired) {
+    state.elements.retakePhotoButton.dataset.wired = "1";
+    state.elements.retakePhotoButton.addEventListener("click", retakePhoto);
+  }
+  if (state.elements.confirmReadingButton && !state.elements.confirmReadingButton.dataset.wired) {
+    state.elements.confirmReadingButton.dataset.wired = "1";
+    state.elements.confirmReadingButton.addEventListener("click", confirmReading);
+  }
+  if (state.elements.cancelReadingButton && !state.elements.cancelReadingButton.dataset.wired) {
+    state.elements.cancelReadingButton.dataset.wired = "1";
+    state.elements.cancelReadingButton.addEventListener("click", cancelReading);
   }
   if (state.elements.disableCameraButton && !state.elements.disableCameraButton.dataset.wired) {
     state.elements.disableCameraButton.dataset.wired = "1";
@@ -732,7 +704,7 @@ function wireCardButtons() {
     }
     if (!state.elements.startCardScanButton.dataset.wired) {
       state.elements.startCardScanButton.dataset.wired = "1";
-      state.elements.startCardScanButton.addEventListener("click", () => startCardReading());
+      state.elements.startCardScanButton.addEventListener("click", captureAndProcessPhoto);
     }
   }
 }
@@ -807,6 +779,97 @@ function detectCardAnswers(videoElement, questionCount) {
     }
     const baseImageData = matToImageData(basePreview);
 
+    warped.delete();
+    basePreview.delete();
+
+    if (state.debug) {
+      drawGridOverlay(baseImageData, reading.rows);
+    }
+
+    return {
+      corners,
+      answers: reading.answers,
+      rows: reading.rows,
+      baseImageData,
+      focusScore,
+    };
+  } finally {
+    src.delete();
+    gray.delete();
+    blur.delete();
+    thresh.delete();
+  }
+}
+
+function detectCardAnswersFromCanvas(canvasElement, questionCount) {
+  if (!canvasElement?.width || !canvasElement?.height) {
+    return null;
+  }
+
+  const src = cv.imread(canvasElement);
+  const gray = new cv.Mat();
+  const blur = new cv.Mat();
+  const thresh = new cv.Mat();
+
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.equalizeHist(gray, gray);
+    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+    cv.threshold(blur, thresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+    if (state.opencvKernel) {
+      cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
+    }
+
+    let markers = findMarkersV2(thresh, canvasElement.width, canvasElement.height);
+    if (markers.length < 4) {
+      markers = findMarkers(thresh, canvasElement.width, canvasElement.height);
+    }
+
+    if (markers.length < 4) {
+      cv.adaptiveThreshold(
+        blur,
+        thresh,
+        255,
+        cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv.THRESH_BINARY_INV,
+        31,
+        7,
+      );
+      if (state.opencvKernel) {
+        cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
+      }
+      markers = findMarkersV2(thresh, canvasElement.width, canvasElement.height);
+      if (markers.length < 4) {
+        markers = findMarkers(thresh, canvasElement.width, canvasElement.height);
+      }
+      if (markers.length < 4) {
+        return null;
+      }
+    }
+
+    const corners = orderCorners(markers.slice(0, 4).map((marker) => marker.center));
+    if (rectangleScore(corners, canvasElement.width, canvasElement.height) < MIN_CARD_RECTANGLE_SCORE) {
+      return null;
+    }
+
+    const warped = perspectiveWarp(gray, corners);
+    const focusScore = measureFocus(warped);
+    if (focusScore < MIN_FOCUS_SCORE * 0.75) {
+      warped.delete();
+      return null;
+    }
+
+    const basePreview = new cv.Mat();
+    cv.cvtColor(warped, basePreview, cv.COLOR_GRAY2RGBA);
+
+    let reading;
+    try {
+      reading = readAnswersFromWarpedV2(warped, questionCount);
+    } catch {
+      reading = readAnswersFromWarped(warped, questionCount);
+    }
+
+    const baseImageData = matToImageData(basePreview);
     warped.delete();
     basePreview.delete();
 
@@ -1437,7 +1500,104 @@ function correctProof() {
     <div><strong>Nota:</strong> ${result.nota}</div>
     <div><strong>Legenda:</strong> verde = correta, vermelho = errada.</div>
   `;
-  setStatus("Leitura concluida.");
+  setStatus("Leitura concluída.");
+}
+
+function resetReadingUi() {
+  state.answers = {};
+  state.stableSignature = "";
+  state.stableCount = 0;
+  state.lastDetection = null;
+  if (state.elements?.resultPanel) {
+    state.elements.resultPanel.classList.add("hidden");
+    state.elements.resultPanel.innerHTML = "";
+  }
+  clearOverlay();
+  updateRenderedAnswers();
+  if (state.elements?.alignedCanvas) {
+    const context = state.elements.alignedCanvas.getContext("2d");
+    context?.clearRect(0, 0, state.elements.alignedCanvas.width, state.elements.alignedCanvas.height);
+  }
+}
+
+async function captureAndProcessPhoto() {
+  if (!state.proof) {
+    setStatus("Nenhuma prova carregada.");
+    return;
+  }
+  if (!state.opencvReady) {
+    setStatus("OpenCV ainda está carregando.");
+    return;
+  }
+  if (!state.stream || !state.elements.video?.srcObject) {
+    setStatus("Habilite a câmera antes de capturar a foto.");
+    return;
+  }
+
+  resetReadingUi();
+  setWorkflowState("answerScanning", "Capturando foto…");
+  updateCardControls();
+
+  // Captura frame estático do preview.
+  const video = state.elements.video;
+  const videoWidth = video.videoWidth || 0;
+  const videoHeight = video.videoHeight || 0;
+  if (videoWidth < 120 || videoHeight < 120) {
+    setWorkflowState("error", "Vídeo ainda não está pronto. Tente novamente.");
+    updateCardControls();
+    return;
+  }
+
+  const scale = Math.min(1, CARD_PROCESSING_MAX_WIDTH / Math.max(videoWidth, 1));
+  processingCanvas.width = Math.max(1, Math.round(videoWidth * scale));
+  processingCanvas.height = Math.max(1, Math.round(videoHeight * scale));
+  const ctx = processingCanvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(video, 0, 0, processingCanvas.width, processingCanvas.height);
+
+  // Fecha o preview para evitar travas durante o processamento.
+  stopAnswerCamera();
+
+  setWorkflowState("answerScanning", "Processando foto…");
+  updateCardControls();
+
+  let detection = null;
+  try {
+    detection = detectCardAnswersFromCanvas(processingCanvas, state.proof.quantidade_questoes);
+  } catch (error) {
+    detection = null;
+  }
+
+  if (!detection) {
+    setWorkflowState("error", "Não foi possível identificar os 4 marcadores. Alinhe melhor e tire outra foto.");
+    updateCardControls();
+    return;
+  }
+
+  state.lastDetection = detection;
+  state.answers = { ...detection.answers };
+  updateRenderedAnswers();
+  drawAlignedPreview(detection.baseImageData);
+  correctProof();
+  setWorkflowState("answerDetected");
+  updateCardControls();
+}
+
+function retakePhoto() {
+  resetReadingUi();
+  setWorkflowState("waitingUserToStartAnswerScan", "Toque em “Habilitar câmera” e alinhe o cartão.");
+  updateCardControls();
+}
+
+function confirmReading() {
+  setStatus("Leitura confirmada.");
+  // Mantém resultados na tela; usuário pode tocar em "Ler outro QR" se desejar.
+}
+
+function cancelReading() {
+  resetReadingUi();
+  stopAnswerCamera();
+  setWorkflowState("waitingUserToStartAnswerScan", "Leitura cancelada. Toque em “Habilitar câmera” para tentar novamente.");
+  updateCardControls();
 }
 
 function correctProofLocally(proof, answers) {
@@ -1569,30 +1729,43 @@ function updateCardControls() {
 
   const cameraEnabled = Boolean(state.stream && state.elements.video?.srcObject);
   const scanning = state.workflow === "answerScanning";
+  const photoMode = true;
+  const photoReady = state.workflow === "answerDetected";
 
   setCameraPanelVisible(cameraEnabled);
 
   // Novo layout (index.html atualizado)
   if (state.elements?.enableCameraButton) {
     state.elements.enableCameraButton.classList.toggle("hidden", cameraEnabled);
-    state.elements.enableCameraButton.disabled = scanning;
+    state.elements.enableCameraButton.disabled = scanning || !state.opencvReady;
 
-    if (state.elements.startReadingButton) {
-      state.elements.startReadingButton.classList.toggle("hidden", !cameraEnabled || scanning);
-      state.elements.startReadingButton.disabled = !state.opencvReady || scanning;
+    if (state.elements.capturePhotoButton) {
+      state.elements.capturePhotoButton.classList.toggle("hidden", !cameraEnabled || scanning || photoReady);
+      state.elements.capturePhotoButton.disabled = scanning || !cameraEnabled;
     }
 
-    if (state.elements.stopReadingButton) {
-      state.elements.stopReadingButton.classList.toggle("hidden", !scanning);
-      state.elements.stopReadingButton.disabled = !scanning;
+    if (state.elements.retakePhotoButton) {
+      state.elements.retakePhotoButton.classList.toggle("hidden", scanning || (!photoReady && cameraEnabled));
+      state.elements.retakePhotoButton.disabled = scanning;
+    }
+
+    if (state.elements.confirmReadingButton) {
+      state.elements.confirmReadingButton.classList.toggle("hidden", !photoReady);
+      state.elements.confirmReadingButton.disabled = false;
+    }
+
+    if (state.elements.cancelReadingButton) {
+      const showCancel = photoReady || cameraEnabled || scanning;
+      state.elements.cancelReadingButton.classList.toggle("hidden", !showCancel);
+      state.elements.cancelReadingButton.disabled = false;
     }
 
     if (state.elements.disableCameraButton) {
-      state.elements.disableCameraButton.classList.toggle("hidden", !cameraEnabled);
+      state.elements.disableCameraButton.classList.toggle("hidden", !cameraEnabled || scanning || photoReady);
       state.elements.disableCameraButton.disabled = scanning;
     }
 
-    if (cameraEnabled && !scanning) {
+    if (cameraEnabled && !scanning && !photoReady) {
       drawAnswerGuide();
     }
     return;
