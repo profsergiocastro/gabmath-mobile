@@ -120,6 +120,15 @@ input {
   font: inherit;
 }
 
+select {
+  font: inherit;
+  width: 100%;
+  border: 1px solid #c9d8e7;
+  border-radius: 12px;
+  padding: 12px;
+  background: #fff;
+}
+
 button {
   border: 0;
   border-radius: 14px;
@@ -267,7 +276,7 @@ button.full {
 .results-table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 720px;
+  min-width: 980px;
 }
 
 .results-table th,
@@ -285,6 +294,15 @@ button.full {
 
 .results-table td.actions-cell {
   white-space: nowrap;
+}
+
+.muted-cell {
+  color: #5c6b7a;
+  font-size: 0.88rem;
+  max-width: 280px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .pill {

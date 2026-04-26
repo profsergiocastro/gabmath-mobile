@@ -9,8 +9,8 @@
 <body data-page="results">
   <main class="app-shell">
     <section class="card">
-      <h1>Resultados da Prova</h1>
-      <p class="subtitle">Consulte, organize e exporte os resultados corrigidos.</p>
+      <h1>Resultados das Provas</h1>
+      <p class="subtitle">Consulte, organize, edite e exporte os resultados corrigidos.</p>
 
       <div class="status-bar">
         <span id="mode-badge" class="mode-badge">Resultados</span>
@@ -19,11 +19,11 @@
       <div class="step">
         <div class="summary">
           <label class="field" style="margin-top: 0;">
-            <span>Prova</span>
+            <span>Avaliação</span>
             <select id="exam-select"></select>
           </label>
           <label class="field" style="margin-top: 0;">
-            <span>Nome da prova (editável)</span>
+            <span>Nome da avaliação (editável)</span>
             <input id="exam-name-input" type="text" placeholder="Ex.: Prova Mensal - Turma 01">
           </label>
           <div class="actions single-column" style="margin-top: 0;">
@@ -55,6 +55,8 @@
           <table class="results-table">
             <thead>
               <tr>
+                <th>Cartão</th>
+                <th>ID completo</th>
                 <th>Aluno</th>
                 <th>Nota</th>
                 <th>Acertos</th>
@@ -82,6 +84,14 @@
           <div id="student-dialog-body"></div>
           <div class="actions single-column">
             <button id="close-student-dialog" class="secondary full">Fechar</button>
+          </div>
+        </dialog>
+
+        <dialog id="edit-dialog" class="student-dialog">
+          <div id="edit-dialog-body"></div>
+          <div class="actions single-column">
+            <button id="save-edit-dialog" class="full">Salvar alterações</button>
+            <button id="cancel-edit-dialog" class="secondary full">Cancelar</button>
           </div>
         </dialog>
       </div>

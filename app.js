@@ -28,6 +28,7 @@ const BUBBLE_AMBIGUOUS_RELATIVE = 0.9;
 const BUBBLE_AMBIGUOUS_GAP = 0.035;
 const MARKER_CORNER_BONUS = 0.6;
 const CARD_ASPECT = CARD_TARGET.width / CARD_TARGET.height;
+const MARKER_RECT_ASPECT = (CARD_TARGET.rightMarkerX - CARD_TARGET.leftMarkerX) / Math.max((CARD_TARGET.bottomMarkerY - CARD_TARGET.topMarkerY), 1);
 
 // Marcadores (multiescala): aceitar quadrados pequenos (cartão longe) e grandes (cartão perto).
 const MARKER_MIN_AREA_RATIO = 0.000012;
@@ -54,6 +55,7 @@ const state = {
   lastQrValue: "",
   lastQrAt: 0,
   lastResult: null,
+  editing: null,
   elements: {},
   page: "",
 };
@@ -88,6 +90,31 @@ function parseExamIdDate(examId) {
   const iso = `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}`;
   const label = `${dd}/${mm}/${yyyy} às ${hh}h${mi}min${ss}s`;
   return { iso, label };
+}
+
+function parseExamAndStudentCardId(fullExamId) {
+  const raw = String(fullExamId || "").trim();
+  const match = raw.match(/^(.*?)-(\d+)$/);
+  if (!match) {
+    return { fullExamId: raw, examGroupId: raw, studentCardId: null };
+  }
+  const examGroupId = match[1];
+  const studentCardId = match[2];
+  if (!examGroupId) {
+    return { fullExamId: raw, examGroupId: raw, studentCardId: null };
+  }
+  return { fullExamId: raw, examGroupId, studentCardId };
+}
+
+function createResultId() {
+  try {
+    if (window.crypto?.randomUUID) {
+      return window.crypto.randomUUID();
+    }
+  } catch {
+    // ignore
+  }
+  return `r_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function hasResultsAccess() {
@@ -270,32 +297,38 @@ function initializeResultsPage() {
     studentDialog: document.getElementById("student-dialog"),
     studentDialogBody: document.getElementById("student-dialog-body"),
     closeStudentDialog: document.getElementById("close-student-dialog"),
+    editDialog: document.getElementById("edit-dialog"),
+    editDialogBody: document.getElementById("edit-dialog-body"),
+    saveEditDialog: document.getElementById("save-edit-dialog"),
+    cancelEditDialog: document.getElementById("cancel-edit-dialog"),
   };
 
   setBadge("Resultados");
 
   const store = loadResultsStore();
-  const examIds = Object.keys(store.exams || {}).sort((a, b) => a.localeCompare(b));
-  if (!examIds.length) {
+  const examGroupIds = Object.keys(store.examGroups || {}).sort((a, b) => a.localeCompare(b));
+  if (!examGroupIds.length) {
     state.elements.examSelect.innerHTML = "<option value=\"\">Nenhuma prova salva</option>";
     state.elements.examSummary.innerHTML = "<div>Nenhum resultado salvo ainda.</div>";
     return;
   }
 
-  const selectedFromQuery = getQueryParam("examId");
-  const selectedExamId = selectedFromQuery && examIds.includes(selectedFromQuery) ? selectedFromQuery : examIds[0];
+  const selectedFromQuery = getQueryParam("examGroupId") || getQueryParam("examId");
+  const selectedExamGroupId = selectedFromQuery && examGroupIds.includes(selectedFromQuery)
+    ? selectedFromQuery
+    : examGroupIds[0];
 
-  state.elements.examSelect.innerHTML = examIds
-    .map((examId) => {
-      const exam = store.exams?.[examId];
-      const name = String(exam?.examName || examId);
-      return `<option value="${escapeHtml(examId)}"${examId === selectedExamId ? " selected" : ""}>${escapeHtml(name)}</option>`;
+  state.elements.examSelect.innerHTML = examGroupIds
+    .map((examGroupId) => {
+      const group = store.examGroups?.[examGroupId];
+      const name = String(group?.examName || examGroupId);
+      return `<option value="${escapeHtml(examGroupId)}"${examGroupId === selectedExamGroupId ? " selected" : ""}>${escapeHtml(name)}</option>`;
     })
     .join("");
 
   state.elements.examSelect.addEventListener("change", () => {
     const next = state.elements.examSelect.value;
-    window.history.replaceState({}, "", `./resultados.html?examId=${encodeURIComponent(next)}`);
+    window.history.replaceState({}, "", `./resultados.html?examGroupId=${encodeURIComponent(next)}`);
     renderResultsPage();
   });
   state.elements.sortSelect.addEventListener("change", renderResultsPage);
@@ -304,6 +337,12 @@ function initializeResultsPage() {
   state.elements.exportQuestionsCsv.addEventListener("click", () => exportQuestionsCsv(state.elements.examSelect.value));
   state.elements.exportJson.addEventListener("click", () => exportExamJson(state.elements.examSelect.value));
   state.elements.closeStudentDialog.addEventListener("click", () => state.elements.studentDialog.close());
+  if (state.elements.cancelEditDialog) {
+    state.elements.cancelEditDialog.addEventListener("click", () => state.elements.editDialog.close());
+  }
+  if (state.elements.saveEditDialog) {
+    state.elements.saveEditDialog.addEventListener("click", saveEditedStudentResult);
+  }
   if (state.elements.examNameInput) {
     state.elements.examNameInput.addEventListener("change", () => saveExamName(state.elements.examSelect.value));
     state.elements.examNameInput.addEventListener("keydown", (event) => {
@@ -327,11 +366,11 @@ function getQueryParam(name) {
 }
 
 function renderResultsPage() {
-  const examId = state.elements.examSelect.value;
+  const examGroupId = state.elements.examSelect.value;
   const store = loadResultsStore();
-  const exam = store.exams?.[examId];
+  const exam = store.examGroups?.[examGroupId];
   if (!exam) {
-    state.elements.examSummary.innerHTML = "<div>Prova não encontrada.</div>";
+    state.elements.examSummary.innerHTML = "<div>Avaliação não encontrada.</div>";
     state.elements.resultsTbody.innerHTML = "";
     state.elements.questionStats.innerHTML = "";
     return;
@@ -345,7 +384,7 @@ function renderResultsPage() {
     state.elements.examNameInput.value = String(exam.examName || "");
   }
   renderExamSummary(exam, results);
-  renderResultsTable(examId, sorted);
+  renderResultsTable(examGroupId, sorted);
   renderQuestionStats(exam, results);
 }
 
@@ -423,17 +462,17 @@ function renderExamSummary(exam, results) {
   const max = totalStudents ? Math.max(...scores) : 0;
   const min = totalStudents ? Math.min(...scores) : 0;
   const stdev = calculateStandardDeviation(scores);
-  const parsed = parseExamIdDate(exam.examId);
+  const parsed = parseExamIdDate(exam.examGroupId);
 
   const createdLine = parsed.label
     ? `<div><strong>Data de elaboração:</strong> ${escapeHtml(parsed.label)}</div>`
     : "";
 
   state.elements.examSummary.innerHTML = `
-    <div><strong>Prova:</strong> ${escapeHtml(exam.examName || exam.examId || "")}</div>
-    <div><strong>ID:</strong> ${escapeHtml(exam.examId || "")}</div>
+    <div><strong>AvaliaÃ§Ã£o:</strong> ${escapeHtml(exam.examName || exam.examGroupId || "")}</div>
+    <div><strong>ID base:</strong> ${escapeHtml(exam.examGroupId || "")}</div>
     ${createdLine}
-    <div><strong>Alunos corrigidos:</strong> ${totalStudents}</div>
+    <div><strong>CartÃµes/alunos corrigidos:</strong> ${totalStudents}</div>
     <div><strong>Média:</strong> ${mean.toFixed(2)}</div>
     <div><strong>Mediana:</strong> ${median.toFixed(2)}</div>
     <div><strong>Maior:</strong> ${max.toFixed(2)}</div>
@@ -451,12 +490,14 @@ function formatDateTime(iso) {
   }
 }
 
-function renderResultsTable(examId, results) {
+function renderResultsTable(examGroupId, results) {
   const rows = results.map((item) => {
     const percent = Number(item.percentage || 0);
     const pillClass = percent >= 70 ? "ok" : (percent >= 40 ? "neutral" : "bad");
     return `
       <tr>
+        <td>${escapeHtml(item.studentCardId ?? "-")}</td>
+        <td class="muted-cell">${escapeHtml(item.fullExamId || "")}</td>
         <td>${escapeHtml(item.studentName || "")}</td>
         <td>${Number(item.score || 0).toFixed(2)}</td>
         <td>${Number(item.correctCount || 0)}</td>
@@ -464,32 +505,35 @@ function renderResultsTable(examId, results) {
         <td><span class="pill ${pillClass}">${percent.toFixed(2)}%</span></td>
         <td>${escapeHtml(formatDateTime(item.correctedAt))}</td>
         <td class="actions-cell">
-          <button data-action="details" data-student="${escapeHtml(item.studentId || "")}">Detalhes</button>
-          <button class="secondary" data-action="delete" data-student="${escapeHtml(item.studentId || "")}">Excluir</button>
+          <button data-action="edit" data-result="${escapeHtml(item.resultId || "")}">Editar</button>
+          <button data-action="details" data-result="${escapeHtml(item.resultId || "")}">Detalhes</button>
+          <button class="secondary" data-action="delete" data-result="${escapeHtml(item.resultId || "")}">Excluir</button>
         </td>
       </tr>
     `;
   }).join("");
 
-  state.elements.resultsTbody.innerHTML = rows || "<tr><td colspan=\"7\">Nenhum aluno encontrado.</td></tr>";
+  state.elements.resultsTbody.innerHTML = rows || "<tr><td colspan=\"9\">Nenhum aluno encontrado.</td></tr>";
 
   for (const button of state.elements.resultsTbody.querySelectorAll("button[data-action]")) {
     button.addEventListener("click", () => {
       const action = button.dataset.action;
-      const student = button.dataset.student;
+      const resultId = button.dataset.result;
       if (action === "details") {
-        openStudentDetails(examId, student);
+        openStudentDetails(examGroupId, resultId);
+      } else if (action === "edit") {
+        openEditStudentResult(examGroupId, resultId);
       } else if (action === "delete") {
-        deleteStudentResult(examId, student);
+        deleteStudentResult(examGroupId, resultId);
       }
     });
   }
 }
 
-function openStudentDetails(examId, studentId) {
+function openStudentDetails(examGroupId, resultId) {
   const store = loadResultsStore();
-  const exam = store.exams?.[examId];
-  const row = (exam?.results || []).find((item) => String(item.studentId || "") === String(studentId || ""));
+  const exam = store.examGroups?.[examGroupId];
+  const row = (exam?.results || []).find((item) => String(item.resultId || "") === String(resultId || ""));
   if (!row) {
     return;
   }
@@ -497,6 +541,8 @@ function openStudentDetails(examId, studentId) {
   const lines = [];
   lines.push(`<div class="dialog-body">`);
   lines.push(`<h2 style="margin:0 0 8px;">${escapeHtml(row.studentName || "")}</h2>`);
+  lines.push(`<div><strong>Cartão:</strong> ${escapeHtml(row.studentCardId ?? "-")}</div>`);
+  lines.push(`<div><strong>ID completo:</strong> ${escapeHtml(row.fullExamId || "")}</div>`);
   lines.push(`<div><strong>Nota:</strong> ${(Number(row.score || 0)).toFixed(2)} (${(Number(row.percentage || 0)).toFixed(2)}%)</div>`);
   lines.push(`<div><strong>Acertos:</strong> ${Number(row.correctCount || 0)} | <strong>Erros:</strong> ${Number(row.wrongCount || 0)}</div>`);
   lines.push(`<div><strong>Correção:</strong> ${escapeHtml(formatDateTime(row.correctedAt))}</div>`);
@@ -522,10 +568,10 @@ function openStudentDetails(examId, studentId) {
   state.elements.studentDialog.showModal();
 }
 
-function deleteStudentResult(examId, studentId) {
+function deleteStudentResult(examGroupId, resultId) {
   const store = loadResultsStore();
-  const exam = store.exams?.[examId];
-  const row = (exam?.results || []).find((item) => String(item.studentId || "") === String(studentId || ""));
+  const exam = store.examGroups?.[examGroupId];
+  const row = (exam?.results || []).find((item) => String(item.resultId || "") === String(resultId || ""));
   if (!row) {
     return;
   }
@@ -535,13 +581,13 @@ function deleteStudentResult(examId, studentId) {
     return;
   }
 
-  exam.results = (exam.results || []).filter((item) => String(item.studentId || "") !== String(studentId || ""));
+  exam.results = (exam.results || []).filter((item) => String(item.resultId || "") !== String(resultId || ""));
   saveResultsStore(store);
   renderResultsPage();
 }
 
-function saveExamName(examId) {
-  if (!examId) {
+function saveExamName(examGroupId) {
+  if (!examGroupId) {
     return;
   }
   const nextName = String(state.elements.examNameInput?.value || "").trim();
@@ -549,7 +595,7 @@ function saveExamName(examId) {
     return;
   }
   const store = loadResultsStore();
-  const exam = store.exams?.[examId];
+  const exam = store.examGroups?.[examGroupId];
   if (!exam) {
     return;
   }
@@ -557,7 +603,7 @@ function saveExamName(examId) {
   saveResultsStore(store);
 
   try {
-    const selector = `option[value="${CSS.escape(examId)}"]`;
+    const selector = `option[value="${CSS.escape(examGroupId)}"]`;
     const option = state.elements.examSelect?.querySelector(selector);
     if (option) {
       option.textContent = nextName;
@@ -565,6 +611,262 @@ function saveExamName(examId) {
   } catch {
     // ignore
   }
+}
+
+function recalculateQuestionStatus(marked, correct) {
+  const value = String(marked || "").toUpperCase();
+  const expected = String(correct || "").toUpperCase();
+  if (!value) {
+    return "em_branco";
+  }
+  return value === expected ? "correta" : "errada";
+}
+
+function recalculateStudentResult(row, exam) {
+  const answerKey = exam.answerKey || {};
+  const questionIds = Array.isArray(exam.questionIds) && exam.questionIds.length
+    ? exam.questionIds
+    : Object.keys(answerKey).sort((a, b) => a.localeCompare(b));
+
+  const answers = { ...(row.answers || {}) };
+  const questionStatus = {};
+  const questionMeta = {};
+
+  let correctCount = 0;
+  let blankCount = 0;
+
+  for (const qid of questionIds) {
+    const expected = String(answerKey[qid] || "").toUpperCase();
+    const marked = String(answers[qid] || "").toUpperCase();
+    const status = recalculateQuestionStatus(marked, expected);
+    if (status === "correta") {
+      correctCount += 1;
+    } else if (status === "em_branco") {
+      blankCount += 1;
+    }
+    const numero = Number.parseInt(String(qid).replace(/^\D+/, ""), 10) || 0;
+    questionStatus[qid] = status;
+    questionMeta[qid] = {
+      numero,
+      correta: expected,
+      marcada: status === "em_branco" ? "" : marked,
+      marcadas: status === "em_branco" ? [] : [marked],
+      status,
+    };
+  }
+
+  const total = questionIds.length;
+  const wrongCount = Math.max(0, total - correctCount - blankCount);
+  const calculatedScore = total ? Math.round((correctCount / total) * 1000) / 100 : 0;
+  const percentage = total ? Math.round((correctCount / total) * 10000) / 100 : 0;
+
+  const manual = Boolean(row.manualScoreOverride);
+  const score = manual ? (Number(row.score) || 0) : calculatedScore;
+
+  return {
+    ...row,
+    answers,
+    questionStatus,
+    questionMeta,
+    correctCount,
+    wrongCount,
+    blankCount,
+    multipleCount: 0,
+    ambiguousCount: 0,
+    calculatedScore,
+    percentage,
+    score,
+  };
+}
+
+function openEditStudentResult(examGroupId, resultId) {
+  if (!state.elements?.editDialog || !state.elements?.editDialogBody) {
+    alert("Editor não disponível nesta versão.");
+    return;
+  }
+  const store = loadResultsStore();
+  const exam = store.examGroups?.[examGroupId];
+  const row = (exam?.results || []).find((item) => String(item.resultId || "") === String(resultId || ""));
+  if (!exam || !row) {
+    return;
+  }
+
+  state.editing = { examGroupId, resultId };
+
+  const qids = Array.isArray(exam.questionIds) && exam.questionIds.length
+    ? exam.questionIds
+    : Object.keys(exam.answerKey || {}).sort((a, b) => a.localeCompare(b));
+
+  const manual = Boolean(row.manualScoreOverride);
+  const scoreValue = manual ? Number(row.score || 0) : Number(row.calculatedScore ?? row.score ?? 0);
+
+  const lines = [];
+  lines.push(`<div class="dialog-body">`);
+  lines.push(`<h2 style="margin:0 0 8px;">Editar resultado</h2>`);
+  lines.push(`<div><strong>Avaliação:</strong> ${escapeHtml(exam.examName || exam.examGroupId || "")}</div>`);
+  lines.push(`<div><strong>ID base:</strong> ${escapeHtml(exam.examGroupId || "")}</div>`);
+  lines.push(`<div><strong>ID completo:</strong> ${escapeHtml(row.fullExamId || "")}</div>`);
+  lines.push(`<div><strong>Cartão:</strong> ${escapeHtml(row.studentCardId ?? "-")}</div>`);
+
+  lines.push(`<label class="field"><span>Nome do aluno</span><input id="edit-student-name" type="text" value="${escapeHtml(row.studentName || "")}"></label>`);
+
+  lines.push(`<div class="edit-score-row">`);
+  lines.push(`<label class="debug-toggle" style="margin: 10px 0 0;"><input id="edit-manual-score" type="checkbox"${manual ? " checked" : ""}>Sobrescrever nota manualmente</label>`);
+  lines.push(`<label class="field" style="margin-top: 10px;"><span>Nota</span><input id="edit-score" type="number" step="0.01" value="${escapeHtml(String(scoreValue))}"></label>`);
+  lines.push(`<label class="field" style="margin-top: 10px;"><span>Motivo (opcional)</span><input id="edit-score-reason" type="text" value="${escapeHtml(String(row.manualScoreReason || ""))}"></label>`);
+  lines.push(`</div>`);
+
+  lines.push(`<div id="edit-summary" class="summary"></div>`);
+
+  lines.push(`<h3 style="margin:14px 0 6px;">Respostas</h3>`);
+  for (const qid of qids) {
+    const expected = String(exam.answerKey?.[qid] || "").toUpperCase();
+    const current = String(row.answers?.[qid] || "").toUpperCase();
+    const status = recalculateQuestionStatus(current, expected);
+    const css = status === "correta" ? "correct" : (status === "em_branco" ? "blank" : "wrong");
+    lines.push(`
+      <div class="question-line ${css}">
+        <div><strong>${escapeHtml(qid)}</strong></div>
+        <div><strong>Correta:</strong> ${escapeHtml(expected)}</div>
+        <div>
+          <strong>Marcada:</strong>
+          <select class="edit-answer" data-qid="${escapeHtml(qid)}">
+            <option value=""></option>
+            ${["A","B","C","D","E"].map((l) => `<option value="${l}"${l === current ? " selected" : ""}>${l}</option>`).join("")}
+          </select>
+        </div>
+        <div><strong>Status:</strong> <span class="edit-status" data-qid="${escapeHtml(qid)}">${escapeHtml(status.replaceAll("_", " "))}</span></div>
+      </div>
+    `);
+  }
+  lines.push(`</div>`);
+
+  state.elements.editDialogBody.innerHTML = lines.join("");
+
+  const manualToggle = state.elements.editDialogBody.querySelector("#edit-manual-score");
+  const scoreInput = state.elements.editDialogBody.querySelector("#edit-score");
+  const reasonInput = state.elements.editDialogBody.querySelector("#edit-score-reason");
+  const nameInput = state.elements.editDialogBody.querySelector("#edit-student-name");
+
+  const setManualEnabled = () => {
+    const enabled = Boolean(manualToggle?.checked);
+    if (scoreInput) {
+      scoreInput.disabled = !enabled;
+    }
+    if (reasonInput) {
+      reasonInput.disabled = !enabled;
+    }
+  };
+
+  const updatePreview = () => {
+    const temp = {
+      ...row,
+      studentName: String(nameInput?.value || row.studentName || "").trim(),
+      studentId: normalizeName(String(nameInput?.value || row.studentName || "")),
+      manualScoreOverride: Boolean(manualToggle?.checked),
+      score: Number(scoreInput?.value || 0),
+      manualScoreReason: String(reasonInput?.value || ""),
+      answers: {},
+    };
+    for (const select of state.elements.editDialogBody.querySelectorAll("select.edit-answer")) {
+      const qid = select.dataset.qid;
+      temp.answers[qid] = String(select.value || "").toUpperCase();
+    }
+    const updated = recalculateStudentResult(temp, exam);
+
+    const summary = state.elements.editDialogBody.querySelector("#edit-summary");
+    if (summary) {
+      summary.innerHTML = `
+        <div><strong>Calculada:</strong> ${Number(updated.calculatedScore || 0).toFixed(2)} (${Number(updated.percentage || 0).toFixed(2)}%)</div>
+        <div><strong>Acertos:</strong> ${Number(updated.correctCount || 0)} | <strong>Erros:</strong> ${Number(updated.wrongCount || 0)} | <strong>Em branco:</strong> ${Number(updated.blankCount || 0)}</div>
+      `;
+    }
+
+    for (const qid of qids) {
+      const expected = String(exam.answerKey?.[qid] || "").toUpperCase();
+      const marked = String(updated.answers?.[qid] || "");
+      const status = recalculateQuestionStatus(marked, expected);
+      const statusEl = Array.from(state.elements.editDialogBody.querySelectorAll(".edit-status"))
+        .find((element) => String(element.dataset.qid || "") === String(qid));
+      if (statusEl) {
+        statusEl.textContent = status.replaceAll("_", " ");
+      }
+    }
+
+    if (!updated.manualScoreOverride && scoreInput) {
+      scoreInput.value = String(Number(updated.calculatedScore || 0));
+    }
+  };
+
+  setManualEnabled();
+  updatePreview();
+
+  manualToggle?.addEventListener("change", () => {
+    setManualEnabled();
+    updatePreview();
+  });
+  scoreInput?.addEventListener("input", updatePreview);
+  reasonInput?.addEventListener("input", updatePreview);
+  nameInput?.addEventListener("input", updatePreview);
+  for (const select of state.elements.editDialogBody.querySelectorAll("select.edit-answer")) {
+    select.addEventListener("change", updatePreview);
+  }
+
+  state.elements.editDialog.showModal();
+}
+
+function saveEditedStudentResult() {
+  const editing = state.editing;
+  if (!editing?.examGroupId || !editing?.resultId) {
+    return;
+  }
+  const store = loadResultsStore();
+  const exam = store.examGroups?.[editing.examGroupId];
+  if (!exam) {
+    return;
+  }
+  const index = (exam.results || []).findIndex((item) => String(item.resultId || "") === String(editing.resultId));
+  if (index < 0) {
+    return;
+  }
+
+  const body = state.elements.editDialogBody;
+  const name = String(body?.querySelector("#edit-student-name")?.value || "").trim();
+  if (!name) {
+    alert("Informe o nome do aluno.");
+    return;
+  }
+  const manual = Boolean(body?.querySelector("#edit-manual-score")?.checked);
+  const score = Number(body?.querySelector("#edit-score")?.value || 0);
+  const reason = String(body?.querySelector("#edit-score-reason")?.value || "");
+
+  const previous = exam.results[index];
+  const nextRow = {
+    ...previous,
+    studentName: name,
+    studentId: normalizeName(name),
+    manualScoreOverride: manual,
+    score,
+    manualScoreReason: manual ? reason : "",
+    answers: {},
+  };
+  for (const select of body.querySelectorAll("select.edit-answer")) {
+    const qid = select.dataset.qid;
+    nextRow.answers[qid] = String(select.value || "").toUpperCase();
+  }
+
+  const recalculated = recalculateStudentResult(nextRow, exam);
+  if (manual) {
+    recalculated.score = Number(score || 0);
+  } else {
+    recalculated.score = Number(recalculated.calculatedScore || 0);
+    recalculated.manualScoreReason = "";
+  }
+
+  exam.results[index] = recalculated;
+  saveResultsStore(store);
+  state.elements.editDialog.close();
+  renderResultsPage();
 }
 
 function calculateQuestionStats(exam, results) {
@@ -653,17 +955,19 @@ function downloadBlob(filename, content, mime) {
   URL.revokeObjectURL(url);
 }
 
-function exportStudentsCsv(examId) {
+function exportStudentsCsv(examGroupId) {
   const store = loadResultsStore();
-  const exam = store.exams?.[examId];
+  const exam = store.examGroups?.[examGroupId];
   if (!exam || !(exam.results || []).length) {
     alert("Não há resultados para exportar.");
     return;
   }
   const qids = exam.questionIds || [];
-  const header = ["Aluno", "Nota", "Acertos", "Erros", "Percentual", "Data/Hora", ...qids];
+  const header = ["CartÃ£o", "ID completo", "Aluno", "Nota", "Acertos", "Erros", "Percentual", "Data/Hora", ...qids];
   const rows = (exam.results || []).map((r) => {
     const base = [
+      r.studentCardId ?? "",
+      r.fullExamId ?? "",
       r.studentName,
       Number(r.score || 0).toFixed(2),
       r.correctCount,
@@ -675,12 +979,12 @@ function exportStudentsCsv(examId) {
     return [...base, ...answers];
   });
   const csv = [header, ...rows].map((line) => line.map(csvEscape).join(",")).join("\n");
-  downloadBlob(`${examId}-alunos.csv`, csv, "text/csv;charset=utf-8");
+  downloadBlob(`${examGroupId}-alunos.csv`, csv, "text/csv;charset=utf-8");
 }
 
-function exportQuestionsCsv(examId) {
+function exportQuestionsCsv(examGroupId) {
   const store = loadResultsStore();
-  const exam = store.exams?.[examId];
+  const exam = store.examGroups?.[examGroupId];
   if (!exam || !(exam.results || []).length) {
     alert("Não há resultados para exportar.");
     return;
@@ -698,17 +1002,17 @@ function exportQuestionsCsv(examId) {
     s.difficulty,
   ]);
   const csv = [header, ...rows].map((line) => line.map(csvEscape).join(",")).join("\n");
-  downloadBlob(`${examId}-questoes.csv`, csv, "text/csv;charset=utf-8");
+  downloadBlob(`${examGroupId}-questoes.csv`, csv, "text/csv;charset=utf-8");
 }
 
-function exportExamJson(examId) {
+function exportExamJson(examGroupId) {
   const store = loadResultsStore();
-  const exam = store.exams?.[examId];
+  const exam = store.examGroups?.[examGroupId];
   if (!exam) {
     alert("Prova não encontrada.");
     return;
   }
-  downloadBlob(`${examId}.json`, JSON.stringify(exam, null, 2), "application/json;charset=utf-8");
+  downloadBlob(`${examGroupId}.json`, JSON.stringify(exam, null, 2), "application/json;charset=utf-8");
 }
 
 function csvEscape(value) {
@@ -1390,44 +1694,51 @@ function detectCardAnswersFromCanvas(canvasElement, questionCount) {
         }
         markers = findMarkersV2(thresh, canvasElement.width, canvasElement.height);
       }
-      if (markers.length < 4) {
-        return { ok: false, reason: "markers_not_found" };
-      }
+    if (markers.length < 4) {
+      return { ok: false, reason: "markers_not_found" };
+    }
+  }
+
+    const selection = pickCornerMarkers(markers, canvasElement.width, canvasElement.height);
+    if (!selection.ok) {
+      return { ok: false, reason: selection.reason || "markers_not_found", diagnostics: selection };
+    }
+    if (selection.confidence < 0.12) {
+      return { ok: false, reason: "low_confidence", diagnostics: selection };
     }
 
-    if (state.debug) {
-      try {
-        const preview = new cv.Mat();
-        cv.cvtColor(gray, preview, cv.COLOR_GRAY2RGBA);
-        const imageData = matToImageData(preview);
-        preview.delete();
-        drawMarkerSelectionDebug(imageData, markers.slice(0, 4));
-      } catch {
-        // ignore
-      }
+  if (state.debug) {
+    try {
+      const preview = new cv.Mat();
+      cv.cvtColor(gray, preview, cv.COLOR_GRAY2RGBA);
+      const imageData = matToImageData(preview);
+      preview.delete();
+      drawMarkerSelectionDebug(imageData, selection.markers);
+    } catch {
+      // ignore
     }
+  }
 
-    const corners = orderCorners(markers.slice(0, 4).map((marker) => marker.center));
-    if (rectangleScore(corners, canvasElement.width, canvasElement.height) < MIN_CARD_RECTANGLE_SCORE) {
-      return { ok: false, reason: "bad_geometry" };
-    }
-
-    const warped = perspectiveWarp(gray, corners);
-    const focusScore = measureFocus(warped);
-    if (focusScore < MIN_FOCUS_SCORE * 0.65) {
-      warped.delete();
-      return { ok: false, reason: "blur" };
-    }
+  const corners = selection.corners;
+  const warped = warpCardImage(gray, corners);
+  if (!warped) {
+    return { ok: false, reason: "bad_geometry", diagnostics: selection };
+  }
+  const focusScore = measureFocus(warped);
+  if (focusScore < MIN_FOCUS_SCORE * 0.65) {
+    warped.delete();
+    return { ok: false, reason: "blur" };
+  }
 
     const basePreview = new cv.Mat();
     cv.cvtColor(warped, basePreview, cv.COLOR_GRAY2RGBA);
 
-    let reading;
-    try {
-      reading = readAnswersFromWarpedV2(warped, questionCount);
-    } catch {
-      reading = readAnswersFromWarped(warped, questionCount);
-    }
+  let reading;
+  try {
+    reading = readAnswersFromWarpedV2(warped, questionCount, { leftX: 0, rightX: warped.cols, topY: 0, bottomY: warped.rows });
+  } catch {
+    reading = readAnswersFromWarped(warped, questionCount, { leftX: 0, rightX: warped.cols, topY: 0, bottomY: warped.rows });
+  }
 
     const baseImageData = matToImageData(basePreview);
     warped.delete();
@@ -1437,14 +1748,15 @@ function detectCardAnswersFromCanvas(canvasElement, questionCount) {
       drawGridOverlay(baseImageData, reading.rows);
     }
 
-    return {
-      ok: true,
-      corners,
-      answers: reading.answers,
-      rows: reading.rows,
-      baseImageData,
-      focusScore,
-    };
+  return {
+    ok: true,
+    corners,
+    answers: reading.answers,
+    rows: reading.rows,
+    baseImageData,
+    focusScore,
+    diagnostics: { confidence: selection.confidence, rectScore: selection.rectScore ?? null },
+  };
   } finally {
     src.delete();
     gray.delete();
@@ -1591,28 +1903,8 @@ function findMarkersMultiScale(grayMat) {
     return [];
   }
 
-  let best = null;
-  const limit = Math.min(unique.length, 14);
-  for (let a = 0; a < limit - 3; a += 1) {
-    for (let b = a + 1; b < limit - 2; b += 1) {
-      for (let c = b + 1; c < limit - 1; c += 1) {
-        for (let d = c + 1; d < limit; d += 1) {
-          const combo = [unique[a], unique[b], unique[c], unique[d]];
-          const ordered = orderCorners(combo.map((item) => item.center));
-          const rectScore = rectangleScore(ordered, grayMat.cols, grayMat.rows);
-          const cornerBoost =
-            (combo.reduce((sum, item) => sum + (item.cornerScore || 0), 0) / 4) * MARKER_CORNER_BONUS;
-          const squareBoost = combo.reduce((sum, item) => sum + (item.squareScore || 0), 0) / 4;
-          const score = rectScore * (1 + cornerBoost) * (0.55 + (squareBoost * 0.45));
-          if (!best || score > best.score) {
-            best = { score, markers: combo };
-          }
-        }
-      }
-    }
-  }
-
-  return best ? best.markers : unique.slice(0, 4);
+  // Retorna candidatos (deduplicados) para que a seleção final garanta 1 marcador por canto.
+  return unique;
 }
 
 function collectMarkerCandidates(contours, width, height) {
@@ -1966,10 +2258,197 @@ function rectangleScore(points, frameWidth, frameHeight) {
 
   // Penaliza quadriláteros com proporção muito diferente do cartão.
   const quadAspect = ((widthTop + widthBottom) / 2) / Math.max((heightLeft + heightRight) / 2, 1);
-  const aspectError = Math.abs(quadAspect - CARD_ASPECT) / Math.max(CARD_ASPECT, 1e-6);
+  const aspectError = Math.abs(quadAspect - MARKER_RECT_ASPECT) / Math.max(MARKER_RECT_ASPECT, 1e-6);
   const aspectScore = clamp(1 - aspectError, 0, 1);
 
   return normalizedArea * widthBalance * heightBalance * (0.35 + (aspectScore * 0.65));
+}
+
+function isConvexQuad(points) {
+  if (!points || points.length !== 4) {
+    return false;
+  }
+  const cross = (a, b, c) => ((b.x - a.x) * (c.y - a.y)) - ((b.y - a.y) * (c.x - a.x));
+  const z1 = cross(points[0], points[1], points[2]);
+  const z2 = cross(points[1], points[2], points[3]);
+  const z3 = cross(points[2], points[3], points[0]);
+  const z4 = cross(points[3], points[0], points[1]);
+  const hasPos = z1 > 0 || z2 > 0 || z3 > 0 || z4 > 0;
+  const hasNeg = z1 < 0 || z2 < 0 || z3 < 0 || z4 < 0;
+  return !(hasPos && hasNeg);
+}
+
+function validateCornerGeometry(orderedCorners, frameWidth, frameHeight) {
+  const reasons = [];
+  if (!orderedCorners || orderedCorners.length !== 4) {
+    return { ok: false, rectScore: 0, reasons: ["corners_invalid"] };
+  }
+  if (!isConvexQuad(orderedCorners)) {
+    reasons.push("quadrilatero_nao_convexo");
+  }
+
+  const [tl, tr, br, bl] = orderedCorners;
+  const widthTop = distance(tl, tr);
+  const widthBottom = distance(bl, br);
+  const heightLeft = distance(tl, bl);
+  const heightRight = distance(tr, br);
+
+  const widthBalance = 1 - Math.abs(widthTop - widthBottom) / Math.max(widthTop, widthBottom, 1);
+  const heightBalance = 1 - Math.abs(heightLeft - heightRight) / Math.max(heightLeft, heightRight, 1);
+  if (widthBalance < 0.55) {
+    reasons.push("larguras_incompativeis");
+  }
+  if (heightBalance < 0.55) {
+    reasons.push("alturas_incompativeis");
+  }
+
+  const rectScore = rectangleScore(orderedCorners, frameWidth, frameHeight);
+  if (rectScore < MIN_CARD_RECTANGLE_SCORE) {
+    reasons.push("area_ou_proporcao_ruim");
+  }
+
+  const minDist = Math.min(
+    distance(tl, tr),
+    distance(tr, br),
+    distance(br, bl),
+    distance(bl, tl),
+  );
+  if (minDist < Math.min(frameWidth, frameHeight) * 0.06) {
+    reasons.push("marcadores_muito_proximos");
+  }
+
+  return { ok: reasons.length === 0, rectScore, reasons };
+}
+
+function markerQualityScore(marker, width, height) {
+  const square = clamp(Number(marker.squareScore || 0), 0, 1);
+  const corner = clamp(Number(marker.cornerScore || 0), 0, 1);
+  const area = clamp(Math.sqrt(Number(marker.area || 0)) / Math.sqrt(Math.max(width * height, 1)), 0, 1);
+  return (square * 0.55) + (corner * 0.3) + (area * 0.15);
+}
+
+function pickCornerMarkers(candidates, width, height) {
+  if (!Array.isArray(candidates) || candidates.length < 4) {
+    return { ok: false, reason: "markers_not_found", markers: [], corners: [], confidence: 0 };
+  }
+
+  const imageCorners = {
+    tl: { x: 0, y: 0 },
+    tr: { x: width, y: 0 },
+    br: { x: width, y: height },
+    bl: { x: 0, y: height },
+  };
+  const diag = Math.hypot(width, height);
+  const proximityScore = (marker, corner) => {
+    const dist = distance(marker.center, corner);
+    return clamp(1 - (dist / Math.max(diag * 0.78, 1)), 0, 1);
+  };
+
+  const scored = candidates.map((marker, index) => {
+    const quality = markerQualityScore(marker, width, height);
+    return {
+      marker,
+      index,
+      quality,
+      tl: quality + (proximityScore(marker, imageCorners.tl) * 0.9),
+      tr: quality + (proximityScore(marker, imageCorners.tr) * 0.9),
+      br: quality + (proximityScore(marker, imageCorners.br) * 0.9),
+      bl: quality + (proximityScore(marker, imageCorners.bl) * 0.9),
+    };
+  });
+
+  const topFor = (key) => scored
+    .slice()
+    .sort((a, b) => (b[key] - a[key]))
+    .slice(0, 7);
+
+  const listTL = topFor("tl");
+  const listTR = topFor("tr");
+  const listBR = topFor("br");
+  const listBL = topFor("bl");
+
+  let best = null;
+  for (const tl of listTL) {
+    for (const tr of listTR) {
+      if (tr.index === tl.index) continue;
+      for (const br of listBR) {
+        if (br.index === tl.index || br.index === tr.index) continue;
+        for (const bl of listBL) {
+          if (bl.index === tl.index || bl.index === tr.index || bl.index === br.index) continue;
+          const quad = [tl.marker.center, tr.marker.center, br.marker.center, bl.marker.center];
+          const ordered = orderCorners(quad);
+          const validation = validateCornerGeometry(ordered, width, height);
+          if (!validation.ok) continue;
+
+          const qualityAvg = (tl.quality + tr.quality + br.quality + bl.quality) / 4;
+          const proximityAvg = (
+            proximityScore(tl.marker, imageCorners.tl) +
+            proximityScore(tr.marker, imageCorners.tr) +
+            proximityScore(br.marker, imageCorners.br) +
+            proximityScore(bl.marker, imageCorners.bl)
+          ) / 4;
+
+          const score = validation.rectScore * (1 + (qualityAvg * 0.85)) * (1 + (proximityAvg * 0.7));
+          if (!best || score > best.score) {
+            best = { score, rectScore: validation.rectScore, markers: [tl.marker, tr.marker, br.marker, bl.marker], corners: ordered };
+          }
+        }
+      }
+    }
+  }
+
+  if (!best) {
+    return { ok: false, reason: "bad_geometry", markers: [], corners: [], confidence: 0 };
+  }
+  const confidence = clamp((best.rectScore - MIN_CARD_RECTANGLE_SCORE) / 0.2, 0, 1);
+  return { ok: true, markers: best.markers, corners: best.corners, rectScore: best.rectScore, confidence };
+}
+
+function warpCardImage(grayMat, orderedCorners) {
+  const [tl, tr, br, bl] = orderedCorners;
+  const widthTop = distance(tl, tr);
+  const widthBottom = distance(bl, br);
+  const heightLeft = distance(tl, bl);
+  const heightRight = distance(tr, br);
+
+  let targetWidth = Math.round((widthTop + widthBottom) / 2);
+  let targetHeight = Math.round((heightLeft + heightRight) / 2);
+  targetWidth = Math.max(360, Math.min(1400, targetWidth));
+  targetHeight = Math.max(520, Math.min(2000, targetHeight));
+
+  const targetAspect = targetWidth / Math.max(targetHeight, 1);
+  const aspectError = Math.abs(targetAspect - MARKER_RECT_ASPECT) / Math.max(MARKER_RECT_ASPECT, 1e-6);
+  if (aspectError > 0.45) {
+    return null;
+  }
+
+  const srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+    tl.x, tl.y,
+    tr.x, tr.y,
+    bl.x, bl.y,
+    br.x, br.y,
+  ]);
+  const dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+    0, 0,
+    targetWidth - 1, 0,
+    0, targetHeight - 1,
+    targetWidth - 1, targetHeight - 1,
+  ]);
+  const matrix = cv.getPerspectiveTransform(srcTri, dstTri);
+  const warped = new cv.Mat();
+  cv.warpPerspective(
+    grayMat,
+    warped,
+    matrix,
+    new cv.Size(targetWidth, targetHeight),
+    cv.INTER_LINEAR,
+    cv.BORDER_CONSTANT,
+    new cv.Scalar(255, 255, 255, 255),
+  );
+  srcTri.delete();
+  dstTri.delete();
+  matrix.delete();
+  return warped;
 }
 
 function perspectiveWarp(grayMat, corners) {
@@ -2015,24 +2494,29 @@ function measureFocus(grayMat) {
   return score;
 }
 
-function readAnswersFromWarped(warpedGray, questionCount) {
+function readAnswersFromWarped(warpedGray, questionCount, bounds) {
   const answers = {};
   const rows = [];
   const thresholded = new cv.Mat();
   cv.threshold(warpedGray, thresholded, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
 
-  const stepX = (CARD_TARGET.rightMarkerX - CARD_TARGET.leftMarkerX) / 6;
-  const stepY = (CARD_TARGET.bottomMarkerY - CARD_TARGET.topMarkerY) / (questionCount + 1);
+  const leftX = Number(bounds?.leftX ?? CARD_TARGET.leftMarkerX);
+  const rightX = Number(bounds?.rightX ?? CARD_TARGET.rightMarkerX);
+  const topY = Number(bounds?.topY ?? CARD_TARGET.topMarkerY);
+  const bottomY = Number(bounds?.bottomY ?? CARD_TARGET.bottomMarkerY);
+
+  const stepX = (rightX - leftX) / 6;
+  const stepY = (bottomY - topY) / (questionCount + 1);
   const bubbleRadius = Math.min(stepX, stepY) * 0.34;
   const sampleRadius = bubbleRadius * 0.58;
 
   for (let questionIndex = 1; questionIndex <= questionCount; questionIndex += 1) {
-    const centerY = CARD_TARGET.topMarkerY + (stepY * questionIndex);
+    const centerY = topY + (stepY * questionIndex);
     const scores = [];
     const centers = [];
 
     for (let optionIndex = 1; optionIndex <= 5; optionIndex += 1) {
-      const centerX = CARD_TARGET.leftMarkerX + (stepX * optionIndex);
+      const centerX = leftX + (stepX * optionIndex);
       centers.push({ x: centerX, y: centerY });
       scores.push(sampleBubbleScore(thresholded, centerX, centerY, sampleRadius));
     }
@@ -2064,12 +2548,17 @@ function readAnswersFromWarped(warpedGray, questionCount) {
   return { answers, rows };
 }
 
-function readAnswersFromWarpedV2(warpedGray, questionCount) {
+function readAnswersFromWarpedV2(warpedGray, questionCount, bounds) {
   const answers = {};
   const rows = [];
 
-  const stepX = (CARD_TARGET.rightMarkerX - CARD_TARGET.leftMarkerX) / 6;
-  const stepY = (CARD_TARGET.bottomMarkerY - CARD_TARGET.topMarkerY) / (questionCount + 1);
+  const leftX = Number(bounds?.leftX ?? CARD_TARGET.leftMarkerX);
+  const rightX = Number(bounds?.rightX ?? CARD_TARGET.rightMarkerX);
+  const topY = Number(bounds?.topY ?? CARD_TARGET.topMarkerY);
+  const bottomY = Number(bounds?.bottomY ?? CARD_TARGET.bottomMarkerY);
+
+  const stepX = (rightX - leftX) / 6;
+  const stepY = (bottomY - topY) / (questionCount + 1);
   const bubbleRadius = Math.min(stepX, stepY) * 0.34;
   const roiRadius = bubbleRadius * 0.62;
   const roiSize = Math.max(22, Math.round(roiRadius * 2.9));
@@ -2085,12 +2574,12 @@ function readAnswersFromWarpedV2(warpedGray, questionCount) {
 
   try {
     for (let questionIndex = 1; questionIndex <= questionCount; questionIndex += 1) {
-      const centerY = CARD_TARGET.topMarkerY + (stepY * questionIndex);
+      const centerY = topY + (stepY * questionIndex);
       const centers = [];
       const scores = [];
 
       for (let optionIndex = 1; optionIndex <= 5; optionIndex += 1) {
-        const centerX = CARD_TARGET.leftMarkerX + (stepX * optionIndex);
+        const centerX = leftX + (stepX * optionIndex);
         centers.push({ x: centerX, y: centerY });
         scores.push(sampleBubbleContrastScore(warpedGray, centerX, centerY, roiSize, innerMask, ringMask));
       }
@@ -2487,6 +2976,11 @@ async function captureAndProcessPhoto() {
         "error",
         "Não foi possível identificar os quatro quadradinhos de alinhamento. Tire uma nova foto com o cartão inteiro visível e boa iluminação.",
       );
+    } else if (reason === "low_confidence") {
+      setWorkflowState(
+        "error",
+        "Os marcadores foram encontrados, mas com baixa confiança. Certifique-se de que os 4 quadradinhos estão visíveis (sem sombras) e tire uma nova foto.",
+      );
     } else if (reason === "bad_geometry") {
       setWorkflowState(
         "error",
@@ -2564,12 +3058,12 @@ function loadResultsStore() {
   try {
     const raw = localStorage.getItem(RESULTS_STORAGE_KEY);
     if (!raw) {
-      return { version: 2, exams: {} };
+      return { version: 3, examGroups: {} };
     }
     const parsed = JSON.parse(raw);
-    return migrateResultsStore(parsed);
+    return migrateResultsStoreV3(parsed);
   } catch {
-    return { version: 2, exams: {} };
+    return { version: 3, examGroups: {} };
   }
 }
 
@@ -2656,6 +3150,102 @@ function migrateResultsStore(parsed) {
   return empty;
 }
 
+function migrateResultsStoreV3(parsed) {
+  const empty = { version: 3, examGroups: {} };
+  if (!parsed || typeof parsed !== "object") {
+    return empty;
+  }
+
+  // Se já estiver em v3, normaliza e garante campos.
+  if (parsed.examGroups && typeof parsed.examGroups === "object") {
+    const next = { version: Number(parsed.version) || 3, examGroups: {} };
+    for (const [examGroupId, group] of Object.entries(parsed.examGroups)) {
+      if (!group || typeof group !== "object") {
+        continue;
+      }
+      const parsedDate = parseExamIdDate(examGroupId);
+      const normalized = {
+        examGroupId,
+        examName: String(group.examName || examGroupId),
+        createdAtFromId: String(group.createdAtFromId || parsedDate.iso || ""),
+        answerKey: group.answerKey && typeof group.answerKey === "object" ? group.answerKey : {},
+        questionIds: Array.isArray(group.questionIds) ? group.questionIds : [],
+        results: Array.isArray(group.results) ? group.results : [],
+        annulled: group.annulled && typeof group.annulled === "object" ? group.annulled : {},
+      };
+      normalized.results = normalized.results.map((row) => {
+        const fullExamId = String(row.fullExamId || row.examId || examGroupId);
+        const parsedIds = parseExamAndStudentCardId(fullExamId);
+        return {
+          ...row,
+          resultId: String(row.resultId || createResultId()),
+          fullExamId,
+          studentCardId: row.studentCardId ?? parsedIds.studentCardId,
+          studentId: String(row.studentId || normalizeName(row.studentName || "")),
+        };
+      });
+      next.examGroups[examGroupId] = normalized;
+    }
+    return next;
+  }
+
+  // Converte v2 (exams) para v3 (examGroups).
+  const v2 = migrateResultsStore(parsed);
+  const next = { version: 3, examGroups: {} };
+  const ensureGroup = (examGroupId, base) => {
+    next.examGroups[examGroupId] ||= {
+      examGroupId,
+      examName: base.examName || examGroupId,
+      createdAtFromId: base.createdAtFromId || "",
+      answerKey: base.answerKey || {},
+      questionIds: base.questionIds || [],
+      results: [],
+      annulled: base.annulled || {},
+    };
+    if (base.answerKey && Object.keys(base.answerKey).length) {
+      next.examGroups[examGroupId].answerKey = base.answerKey;
+    }
+    if (Array.isArray(base.questionIds) && base.questionIds.length) {
+      next.examGroups[examGroupId].questionIds = base.questionIds;
+    }
+    if (base.examName && (!next.examGroups[examGroupId].examName || next.examGroups[examGroupId].examName === examGroupId)) {
+      next.examGroups[examGroupId].examName = base.examName;
+    }
+    if (base.createdAtFromId && !next.examGroups[examGroupId].createdAtFromId) {
+      next.examGroups[examGroupId].createdAtFromId = base.createdAtFromId;
+    }
+    return next.examGroups[examGroupId];
+  };
+
+  for (const [fullExamId, exam] of Object.entries(v2.exams || {})) {
+    if (!exam || typeof exam !== "object") {
+      continue;
+    }
+    const ids = parseExamAndStudentCardId(fullExamId);
+    const parsedDate = parseExamIdDate(ids.examGroupId);
+    const group = ensureGroup(ids.examGroupId, {
+      examName: String(exam.examName || ids.examGroupId),
+      createdAtFromId: String(exam.createdAtFromId || parsedDate.iso || ""),
+      answerKey: exam.answerKey && typeof exam.answerKey === "object" ? exam.answerKey : {},
+      questionIds: Array.isArray(exam.questionIds) ? exam.questionIds : [],
+      annulled: exam.annulled && typeof exam.annulled === "object" ? exam.annulled : {},
+    });
+    for (const row of Array.isArray(exam.results) ? exam.results : []) {
+      const rowFull = String(row.fullExamId || row.examId || fullExamId);
+      const rowIds = parseExamAndStudentCardId(rowFull);
+      group.results.push({
+        ...row,
+        resultId: String(row.resultId || createResultId()),
+        fullExamId: rowFull,
+        studentCardId: row.studentCardId ?? rowIds.studentCardId,
+        studentId: String(row.studentId || normalizeName(row.studentName || "")),
+      });
+    }
+  }
+
+  return next;
+}
+
 function questionIdForNumber(number) {
   return `Q${String(number).padStart(3, "0")}`;
 }
@@ -2665,8 +3255,11 @@ function toIsoNow() {
 }
 
 function saveStudentResult({ proof, result }) {
-  const examId = String(proof.id_prova || "").trim() || "prova";
-  const examName = String(proof.nome_prova || proof.id_prova || "").trim() || examId;
+  const fullExamId = String(proof.id_prova || "").trim() || "prova";
+  const parsedIds = parseExamAndStudentCardId(fullExamId);
+  const examGroupId = parsedIds.examGroupId || fullExamId;
+  const studentCardId = parsedIds.studentCardId;
+  const examName = String(proof.nome_prova || parsedIds.examGroupId || "").trim() || examGroupId;
   const studentName = String(proof.aluno || "").trim();
   if (!studentName) {
     throw new Error("Informe o nome do aluno para salvar o resultado.");
@@ -2707,10 +3300,10 @@ function saveStudentResult({ proof, result }) {
   }
 
   const store = loadResultsStore();
-  store.exams ||= {};
-  const parsedDate = parseExamIdDate(examId);
-  store.exams[examId] ||= {
-    examId,
+  store.examGroups ||= {};
+  const parsedDate = parseExamIdDate(examGroupId);
+  store.examGroups[examGroupId] ||= {
+    examGroupId,
     examName,
     createdAtFromId: parsedDate.iso || "",
     answerKey,
@@ -2720,12 +3313,12 @@ function saveStudentResult({ proof, result }) {
   };
 
   // Atualiza gabarito se já existir (mantém o mais recente).
-  store.exams[examId].answerKey = answerKey;
-  store.exams[examId].questionIds = questionIds;
-  store.exams[examId].examName = store.exams[examId].examName || examName;
-  store.exams[examId].createdAtFromId = store.exams[examId].createdAtFromId || parsedDate.iso || "";
-  if (!Array.isArray(store.exams[examId].results)) {
-    store.exams[examId].results = [];
+  store.examGroups[examGroupId].answerKey = answerKey;
+  store.examGroups[examGroupId].questionIds = questionIds;
+  store.examGroups[examGroupId].examName = store.examGroups[examGroupId].examName || examName;
+  store.examGroups[examGroupId].createdAtFromId = store.examGroups[examGroupId].createdAtFromId || parsedDate.iso || "";
+  if (!Array.isArray(store.examGroups[examGroupId].results)) {
+    store.examGroups[examGroupId].results = [];
   }
 
   const correctedAt = toIsoNow();
@@ -2734,12 +3327,19 @@ function saveStudentResult({ proof, result }) {
   const wrongCount = Math.max(0, total - correctCount);
   const percentage = total ? Math.round((correctCount / total) * 10000) / 100 : 0;
 
+  const calculatedScore = Number(result.nota || 0);
   const row = {
+    resultId: createResultId(),
+    examGroupId,
+    fullExamId,
+    studentCardId,
     studentId,
     studentName,
-    examId,
+    examId: fullExamId,
     correctedAt,
-    score: Number(result.nota || 0),
+    score: calculatedScore,
+    calculatedScore,
+    manualScoreOverride: false,
     correctCount,
     wrongCount,
     blankCount: Number(result.brancos || 0),
@@ -2752,10 +3352,16 @@ function saveStudentResult({ proof, result }) {
     questionMeta,
   };
 
-  const beforeCount = (store.exams[examId].results || []).length;
-  const existingIndex = (store.exams[examId].results || []).findIndex(
-    (item) => String(item.studentId || "") === String(studentId || "")
-  );
+  const beforeCount = (store.examGroups[examGroupId].results || []).length;
+  const existingIndex = (store.examGroups[examGroupId].results || []).findIndex((item) => {
+    if (String(item.fullExamId || "") === String(fullExamId || "")) {
+      return true;
+    }
+    if (studentCardId && String(item.studentCardId || "") === String(studentCardId)) {
+      return true;
+    }
+    return String(item.studentId || "") === String(studentId || "");
+  });
   if (existingIndex >= 0) {
     const replace = window.confirm(
       `Já existe um resultado para ${studentName} nesta prova. Deseja substituir?`
@@ -2763,18 +3369,20 @@ function saveStudentResult({ proof, result }) {
     if (!replace) {
       throw new Error("Resultado não salvo.");
     }
-    store.exams[examId].results[existingIndex] = row;
+    const previous = store.examGroups[examGroupId].results[existingIndex] || {};
+    row.resultId = String(previous.resultId || row.resultId);
+    store.examGroups[examGroupId].results[existingIndex] = row;
   } else {
-    store.exams[examId].results.push(row);
+    store.examGroups[examGroupId].results.push(row);
   }
 
   console.log(
-    "[Resultados] examId:",
-    examId,
+    "[Resultados] examGroupId:",
+    examGroupId,
     "| antes:",
     beforeCount,
     "| depois:",
-    (store.exams[examId].results || []).length,
+    (store.examGroups[examGroupId].results || []).length,
     "| aluno:",
     studentName,
   );
