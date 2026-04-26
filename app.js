@@ -27,9 +27,9 @@ const MARKER_CORNER_BONUS = 0.6;
 const CARD_ASPECT = CARD_TARGET.width / CARD_TARGET.height;
 
 // Marcadores (multiescala): aceitar quadrados pequenos (cartão longe) e grandes (cartão perto).
-const MARKER_MIN_AREA_RATIO = 0.00002;
+const MARKER_MIN_AREA_RATIO = 0.000012;
 const MARKER_MAX_AREA_RATIO = 0.015;
-const MARKER_MIN_SIDE_RATIO = 0.006;
+const MARKER_MIN_SIDE_RATIO = 0.0045;
 const MARKER_MAX_SIDE_RATIO = 0.28;
 
 const state = {
@@ -1766,11 +1766,12 @@ function drawAlignedPreview(imageData) {
 
 function drawCorrectionPreview(result) {
   if (!state.lastDetection?.baseImageData) {
-    return;
+    return [];
   }
   drawAlignedPreview(state.lastDetection.baseImageData);
   const context = state.elements.alignedCanvas.getContext("2d");
   context.lineWidth = 6;
+  const yellowPoints = [];
 
   for (const detail of result.detalhes) {
     const row = state.lastDetection.rows.find((item) => item.questionNumber === detail.numero);
@@ -1793,7 +1794,19 @@ function drawCorrectionPreview(result) {
       context.strokeStyle = "#d93025";
       context.strokeRect(left, top, width, height);
     }
+
+    // Questão errada (inclui em branco/múltipla/ambígua): marca a alternativa correta com ponto amarelo.
+    const expectedLetter = String(detail.correta || "").toUpperCase();
+    const expectedIndex = ["A", "B", "C", "D", "E"].indexOf(expectedLetter);
+    if (expectedIndex >= 0 && row.centers[expectedIndex]) {
+      const center = row.centers[expectedIndex];
+      const radius = Math.max(3, row.bubbleRadius * 0.22);
+      drawFilledDot(context, center, radius, "#ffcc00");
+      yellowPoints.push({ numero: detail.numero, correta: expectedLetter, x: center.x, y: center.y });
+    }
   }
+
+  return yellowPoints;
 }
 
 function drawCircle(context, center, radius, color) {
@@ -1803,9 +1816,19 @@ function drawCircle(context, center, radius, color) {
   context.stroke();
 }
 
+function drawFilledDot(context, center, radius, color) {
+  context.fillStyle = color;
+  context.strokeStyle = "rgba(30,30,30,0.75)";
+  context.lineWidth = Math.max(1, Math.round(radius * 0.35));
+  context.beginPath();
+  context.arc(center.x, center.y, radius, 0, Math.PI * 2);
+  context.fill();
+  context.stroke();
+}
+
 function correctProof() {
   const result = correctProofLocally(state.proof, state.answers, state.lastDetection?.rows || []);
-  drawCorrectionPreview(result);
+  const yellowPoints = drawCorrectionPreview(result);
   state.elements.resultPanel.classList.remove("hidden");
   state.elements.resultPanel.classList.toggle("wrong", result.acertos !== result.total);
   state.elements.resultPanel.innerHTML = `
@@ -1829,6 +1852,10 @@ function correctProof() {
       scores: item.scores,
       threshold: item.threshold,
     }));
+    const debugBundle = {
+      pontos_corretos: yellowPoints,
+      questoes: debugPayload,
+    };
     const details = document.createElement("details");
     details.style.marginTop = "10px";
     const summary = document.createElement("summary");
@@ -1836,7 +1863,7 @@ function correctProof() {
     const pre = document.createElement("pre");
     pre.style.whiteSpace = "pre-wrap";
     pre.style.fontSize = "0.85rem";
-    pre.textContent = JSON.stringify(debugPayload, null, 2);
+    pre.textContent = JSON.stringify(debugBundle, null, 2);
     details.appendChild(summary);
     details.appendChild(pre);
     state.elements.resultPanel.appendChild(details);
