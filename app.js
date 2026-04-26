@@ -294,6 +294,8 @@ function initializeResultsPage() {
     exportStudentsCsv: document.getElementById("export-students-csv"),
     exportQuestionsCsv: document.getElementById("export-questions-csv"),
     exportJson: document.getElementById("export-json"),
+    importJsonFile: document.getElementById("import-json-file"),
+    importJsonButton: document.getElementById("import-json-button"),
     studentDialog: document.getElementById("student-dialog"),
     studentDialogBody: document.getElementById("student-dialog-body"),
     closeStudentDialog: document.getElementById("close-student-dialog"),
@@ -336,6 +338,9 @@ function initializeResultsPage() {
   state.elements.exportStudentsCsv.addEventListener("click", () => exportStudentsCsv(state.elements.examSelect.value));
   state.elements.exportQuestionsCsv.addEventListener("click", () => exportQuestionsCsv(state.elements.examSelect.value));
   state.elements.exportJson.addEventListener("click", () => exportExamJson(state.elements.examSelect.value));
+  if (state.elements.importJsonButton) {
+    state.elements.importJsonButton.addEventListener("click", importResultsFromJsonFile);
+  }
   state.elements.closeStudentDialog.addEventListener("click", () => state.elements.studentDialog.close());
   if (state.elements.cancelEditDialog) {
     state.elements.cancelEditDialog.addEventListener("click", () => state.elements.editDialog.close());
@@ -469,10 +474,10 @@ function renderExamSummary(exam, results) {
     : "";
 
   state.elements.examSummary.innerHTML = `
-    <div><strong>AvaliaÃ§Ã£o:</strong> ${escapeHtml(exam.examName || exam.examGroupId || "")}</div>
+    <div><strong>Avaliação:</strong> ${escapeHtml(exam.examName || exam.examGroupId || "")}</div>
     <div><strong>ID base:</strong> ${escapeHtml(exam.examGroupId || "")}</div>
     ${createdLine}
-    <div><strong>CartÃµes/alunos corrigidos:</strong> ${totalStudents}</div>
+    <div><strong>Cartões/alunos corrigidos:</strong> ${totalStudents}</div>
     <div><strong>Média:</strong> ${mean.toFixed(2)}</div>
     <div><strong>Mediana:</strong> ${median.toFixed(2)}</div>
     <div><strong>Maior:</strong> ${max.toFixed(2)}</div>
@@ -963,7 +968,7 @@ function exportStudentsCsv(examGroupId) {
     return;
   }
   const qids = exam.questionIds || [];
-  const header = ["CartÃ£o", "ID completo", "Aluno", "Nota", "Acertos", "Erros", "Percentual", "Data/Hora", ...qids];
+  const header = ["Cartão", "ID completo", "Aluno", "Nota", "Acertos", "Erros", "Percentual", "Data/Hora", ...qids];
   const rows = (exam.results || []).map((r) => {
     const base = [
       r.studentCardId ?? "",
@@ -1020,6 +1025,149 @@ function csvEscape(value) {
   const needs = /[",\n]/.test(text);
   const escaped = text.replaceAll("\"", "\"\"");
   return needs ? `"${escaped}"` : escaped;
+}
+
+async function importResultsFromJsonFile() {
+  const file = state.elements.importJsonFile?.files?.[0];
+  if (!file) {
+    alert("Selecione um arquivo JSON para importar.");
+    return;
+  }
+
+  let text = "";
+  try {
+    text = await file.text();
+  } catch {
+    alert("Não foi possível ler o arquivo.");
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    alert("JSON inválido.");
+    return;
+  }
+
+  const incoming = migrateResultsStoreV3(parsed);
+  if (!incoming || !incoming.examGroups || typeof incoming.examGroups !== "object") {
+    alert("Arquivo não contém resultados compatíveis.");
+    return;
+  }
+
+  const store = loadResultsStore();
+  store.examGroups ||= {};
+
+  let addedGroups = 0;
+  let addedResults = 0;
+  let duplicateResults = 0;
+
+  // Primeiro passe: conta duplicidades.
+  for (const [examGroupId, group] of Object.entries(incoming.examGroups)) {
+    const targetGroup = store.examGroups[examGroupId];
+    if (!targetGroup) {
+      continue;
+    }
+    const existing = Array.isArray(targetGroup.results) ? targetGroup.results : [];
+    const incomingResults = Array.isArray(group?.results) ? group.results : [];
+    for (const row of incomingResults) {
+      const fullExamId = String(row.fullExamId || row.examId || "");
+      const studentCardId = row.studentCardId ? String(row.studentCardId) : null;
+      const studentId = String(row.studentId || normalizeName(row.studentName || ""));
+      const match = existing.some((e) =>
+        (row.resultId && String(e.resultId || "") === String(row.resultId)) ||
+        (fullExamId && String(e.fullExamId || e.examId || "") === fullExamId) ||
+        (studentCardId && String(e.studentCardId || "") === studentCardId) ||
+        (studentId && String(e.studentId || "") === studentId)
+      );
+      if (match) {
+        duplicateResults += 1;
+      }
+    }
+  }
+
+  const replaceDuplicates = duplicateResults
+    ? window.confirm(`Foram encontrados ${duplicateResults} resultados duplicados. Deseja substituir pelos do arquivo?`)
+    : false;
+
+  for (const [examGroupId, group] of Object.entries(incoming.examGroups)) {
+    if (!group || typeof group !== "object") {
+      continue;
+    }
+    const baseDate = parseExamIdDate(examGroupId);
+    store.examGroups[examGroupId] ||= {
+      examGroupId,
+      examName: String(group.examName || examGroupId),
+      createdAtFromId: String(group.createdAtFromId || baseDate.iso || ""),
+      answerKey: group.answerKey && typeof group.answerKey === "object" ? group.answerKey : {},
+      questionIds: Array.isArray(group.questionIds) ? group.questionIds : [],
+      results: [],
+      annulled: group.annulled && typeof group.annulled === "object" ? group.annulled : {},
+    };
+
+    const targetGroup = store.examGroups[examGroupId];
+    if (targetGroup.results && !Array.isArray(targetGroup.results)) {
+      targetGroup.results = [];
+    }
+    if (!Array.isArray(targetGroup.results)) {
+      targetGroup.results = [];
+    }
+
+    if (!targetGroup.examName || targetGroup.examName === examGroupId) {
+      targetGroup.examName = String(group.examName || examGroupId);
+    }
+    if (!targetGroup.createdAtFromId) {
+      targetGroup.createdAtFromId = String(group.createdAtFromId || baseDate.iso || "");
+    }
+    if (group.answerKey && Object.keys(group.answerKey).length) {
+      targetGroup.answerKey = group.answerKey;
+    }
+    if (Array.isArray(group.questionIds) && group.questionIds.length) {
+      targetGroup.questionIds = group.questionIds;
+    }
+
+    if (targetGroup === store.examGroups[examGroupId] && targetGroup.results.length === 0 && group.results?.length) {
+      // group criado agora
+      addedGroups += 1;
+    }
+
+    const incomingResults = Array.isArray(group.results) ? group.results : [];
+    for (const row of incomingResults) {
+      const normalizedRow = {
+        ...row,
+        resultId: String(row.resultId || createResultId()),
+        fullExamId: String(row.fullExamId || row.examId || ""),
+        studentCardId: row.studentCardId ?? parseExamAndStudentCardId(String(row.fullExamId || row.examId || "")).studentCardId,
+        studentName: String(row.studentName || ""),
+        studentId: String(row.studentId || normalizeName(row.studentName || "")),
+      };
+
+      const fullExamId = normalizedRow.fullExamId;
+      const studentCardId = normalizedRow.studentCardId ? String(normalizedRow.studentCardId) : null;
+      const studentId = normalizedRow.studentId;
+
+      const existingIndex = targetGroup.results.findIndex((e) =>
+        (normalizedRow.resultId && String(e.resultId || "") === normalizedRow.resultId) ||
+        (fullExamId && String(e.fullExamId || e.examId || "") === fullExamId) ||
+        (studentCardId && String(e.studentCardId || "") === studentCardId) ||
+        (studentId && String(e.studentId || "") === studentId)
+      );
+
+      if (existingIndex >= 0) {
+        if (replaceDuplicates) {
+          targetGroup.results[existingIndex] = { ...targetGroup.results[existingIndex], ...normalizedRow };
+        }
+        continue;
+      }
+      targetGroup.results.push(normalizedRow);
+      addedResults += 1;
+    }
+  }
+
+  saveResultsStore(store);
+  alert(`Importação concluída. Avaliações adicionadas: ${addedGroups}. Resultados adicionados: ${addedResults}.`);
+  window.location.reload();
 }
 
 async function startQrCamera() {

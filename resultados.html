@@ -80,6 +80,16 @@
           <button id="export-json" class="secondary full">Exportar JSON completo</button>
         </div>
 
+        <h2 style="margin-top: 18px;">Importar</h2>
+        <p class="hint">Os resultados ficam salvos localmente no aparelho/navegador. Para ver no computador o que foi corrigido no celular, exporte o JSON no celular e importe aqui.</p>
+        <label class="field" style="margin-top: 10px;">
+          <span>Arquivo JSON</span>
+          <input id="import-json-file" type="file" accept="application/json,.json">
+        </label>
+        <div class="actions single-column" style="margin-top: 0;">
+          <button id="import-json-button" class="full">Importar e mesclar resultados</button>
+        </div>
+
         <dialog id="student-dialog" class="student-dialog">
           <div id="student-dialog-body"></div>
           <div class="actions single-column">
@@ -100,4 +110,3 @@
   <script src="app.js"></script>
 </body>
 </html>
-
