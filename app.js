@@ -1,8 +1,11 @@
 const QR_PAYLOAD_PREFIX = "GABMATH1:";
 const STORAGE_KEY = "gabmath-current-proof";
 const RESULTS_STORAGE_KEY = "gabmath-exam-results-v1";
-const RESULTS_ACCESS_KEY = "gabmath-results-access-ok";
-const RESULTS_ACCESS_CODE = "166130";
+// Gate local (barreira simples, sem segurança real sem backend).
+const ACCESS_FLAG_KEY = "__gm_a";
+const ACCESS_FAIL_KEY = "__gm_f";
+const ACCESS_SALT = ["g", "m", "x", "2", ":", "K", "p"].join("");
+const ACCESS_HASH_B64 = ["dDncK2G3q1lO7Jxu/XnQ0dIjqk4y2TJUx8s9Kh9kXfc"].join("");
 const CARD_TARGET = {
   width: 820,
   height: 1160,
@@ -119,7 +122,7 @@ function createResultId() {
 
 function hasResultsAccess() {
   try {
-    return sessionStorage.getItem(RESULTS_ACCESS_KEY) === "1";
+    return sessionStorage.getItem(ACCESS_FLAG_KEY) === "1";
   } catch {
     return false;
   }
@@ -128,21 +131,79 @@ function hasResultsAccess() {
 function setResultsAccess(ok) {
   try {
     if (ok) {
-      sessionStorage.setItem(RESULTS_ACCESS_KEY, "1");
+      sessionStorage.setItem(ACCESS_FLAG_KEY, "1");
     } else {
-      sessionStorage.removeItem(RESULTS_ACCESS_KEY);
+      sessionStorage.removeItem(ACCESS_FLAG_KEY);
     }
   } catch {
     // ignore
   }
 }
 
-function openResultsWithAccessCode() {
-  const typed = window.prompt("Digite o código de acesso:", "");
-  if (String(typed || "").trim() !== RESULTS_ACCESS_CODE) {
-    window.alert("Código inválido.");
+function getAccessFailState() {
+  try {
+    const raw = sessionStorage.getItem(ACCESS_FAIL_KEY);
+    if (!raw) return { count: 0, until: 0 };
+    const parsed = JSON.parse(raw);
+    return { count: Number(parsed?.count || 0), until: Number(parsed?.until || 0) };
+  } catch {
+    return { count: 0, until: 0 };
+  }
+}
+
+function setAccessFailState(next) {
+  try {
+    sessionStorage.setItem(ACCESS_FAIL_KEY, JSON.stringify(next));
+  } catch {
+    // ignore
+  }
+}
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary).replace(/=+$/g, "");
+}
+
+async function sha256Base64(text) {
+  const data = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return bytesToBase64(new Uint8Array(digest));
+}
+
+async function verifyAccessKey(typed) {
+  const normalized = String(typed || "").trim();
+  if (!normalized) return false;
+  try {
+    const hash = await sha256Base64(`${ACCESS_SALT}:${normalized}`);
+    return hash === ACCESS_HASH_B64;
+  } catch {
+    return false;
+  }
+}
+
+async function openResultsWithAccessCode() {
+  const now = Date.now();
+  const fail = getAccessFailState();
+  if (fail.until && now < fail.until) {
+    window.alert("Aguarde alguns segundos e tente novamente.");
     return;
   }
+
+  const typed = window.prompt("Digite a chave de acesso:", "");
+  const ok = await verifyAccessKey(typed);
+  if (!ok) {
+    const nextCount = fail.count + 1;
+    const penaltySeconds = nextCount >= 5 ? 20 : (nextCount >= 3 ? 8 : 0);
+    setAccessFailState({ count: nextCount, until: penaltySeconds ? (Date.now() + (penaltySeconds * 1000)) : 0 });
+    window.alert("Chave inválida.");
+    return;
+  }
+
+  setAccessFailState({ count: 0, until: 0 });
   setResultsAccess(true);
   window.location.href = "./resultados.html";
 }
@@ -271,11 +332,12 @@ function initializeCardPage() {
   setStatus("Alinhe o celular com o cartão-resposta e toque em “Habilitar câmera”.");
 }
 
-function initializeResultsPage() {
+async function initializeResultsPage() {
   if (!hasResultsAccess()) {
-    const typed = window.prompt("Digite o código de acesso:", "");
-    if (String(typed || "").trim() !== RESULTS_ACCESS_CODE) {
-      window.alert("Código inválido.");
+    const typed = window.prompt("Digite a chave de acesso:", "");
+    const ok = await verifyAccessKey(typed);
+    if (!ok) {
+      window.alert("Chave inválida.");
       window.location.href = "./index.html";
       return;
     }
