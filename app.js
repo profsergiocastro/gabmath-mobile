@@ -4294,7 +4294,7 @@ function updateCardControls() {
   if (state.elements?.startScanButton && state.elements?.stopScanButton && state.elements?.startCardScanButton) {
     state.elements.startScanButton.disabled = scanning;
     state.elements.stopScanButton.disabled = false;
-    state.elements.startCardScanButton.disabled = !cameraEnabled || !state.opencvReady || scanning;
+    state.elements.startCardScanButton.disabled = !state.stream || !state.opencvReady || scanning;
   }
 }
 
