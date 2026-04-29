@@ -15,10 +15,15 @@ const CARD_TARGET = {
   bottomMarkerY: 1010,
 };
 const CARD_PROCESSING_MAX_WIDTH = 960;
+const PHOTO_PROCESSING_MAX_WIDTH = 1600;
 const CARD_FRAME_INTERVAL_MS = 140;
 const MIN_FOCUS_SCORE = 120;
 const REQUIRED_STABLE_FRAMES = 4;
-const MIN_CARD_RECTANGLE_SCORE = 0.12;
+// Score mÃ­nimo para aceitar o quadrilÃ¡tero dos 4 marcadores.
+// Valor mais baixo permite foto com o cartÃ£o mais distante (menor na imagem),
+// mas ainda rejeita casos onde a geometria fica inconsistente.
+const MIN_CARD_RECTANGLE_SCORE = 0.03;
+const GOOD_CARD_RECTANGLE_SCORE = 0.075;
 const MIN_MARKER_FILL_RATIO = 0.62;
 const MIN_MARKER_SIDE = 16;
 const MAX_MARKER_SIDE = 90;
@@ -29,7 +34,10 @@ const SECOND_BUBBLE_RELATIVE_LIMIT = 0.86;
 const BUBBLE_CONTRAST_MIN = 0.085;
 const BUBBLE_AMBIGUOUS_RELATIVE = 0.9;
 const BUBBLE_AMBIGUOUS_GAP = 0.035;
-const MARKER_CORNER_BONUS = 0.6;
+// NÃ£o assumimos que o cartÃ£o esteja prÃ³ximo aos cantos da foto.
+// (O aluno pode fotografar mais distante e o cartÃ£o ficar centralizado.)
+// Mantido apenas por compatibilidade; nÃ£o usamos mais como fator de decisÃ£o.
+const MARKER_CORNER_BONUS = 0.0;
 const CARD_ASPECT = CARD_TARGET.width / CARD_TARGET.height;
 const MARKER_RECT_ASPECT = (CARD_TARGET.rightMarkerX - CARD_TARGET.leftMarkerX) / Math.max((CARD_TARGET.bottomMarkerY - CARD_TARGET.topMarkerY), 1);
 
@@ -1879,7 +1887,17 @@ function detectCardAnswersFromCanvas(canvasElement, questionCount) {
     cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
     cv.equalizeHist(gray, gray);
     // Multiescala: procura marcadores em vários tamanhos para tolerar distância.
-    let markers = findMarkersMultiScale(gray);
+    let markers = [];
+    const illuminationNormalized = normalizeIllumination(gray);
+    try {
+      markers = findMarkersMultiScale(illuminationNormalized || gray);
+    } finally {
+      try {
+        illuminationNormalized?.delete?.();
+      } catch {
+        // ignore
+      }
+    }
 
     // Fallback: pipeline antigo por threshold único.
     if (markers.length < 4) {
@@ -2028,15 +2046,100 @@ function findMarkersV2(binaryMat, width, height) {
   const hierarchy = new cv.Mat();
   try {
     cv.findContours(binaryMat, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-    return collectMarkerCandidatesV3(contours, width, height);
+    const found = collectMarkerCandidatesV3(contours, width, height);
+    if (found.length >= 4) {
+      return found;
+    }
+    // Fallback: componentes conectados costuma ser mais tolerante quando o contorno fica "quebrado" por blur/ruÃ­do.
+    const byComponents = collectMarkerCandidatesConnectedComponents(binaryMat, width, height);
+    return byComponents.length >= 4 ? byComponents : found;
   } finally {
     contours.delete();
     hierarchy.delete();
   }
 }
 
+function collectMarkerCandidatesConnectedComponents(binaryMat, width, height) {
+  if (typeof cv.connectedComponentsWithStats !== "function") {
+    return [];
+  }
+
+  const labels = new cv.Mat();
+  const stats = new cv.Mat();
+  const centroids = new cv.Mat();
+
+  try {
+    const num = cv.connectedComponentsWithStats(binaryMat, labels, stats, centroids, 8, cv.CV_32S);
+    if (!num || num < 2) {
+      return [];
+    }
+
+    const frameArea = width * height;
+    const minArea = frameArea * MARKER_MIN_AREA_RATIO;
+    const maxArea = frameArea * MARKER_MAX_AREA_RATIO;
+    const minDim = Math.min(width, height);
+    const minSide = Math.max(6, Math.round(minDim * MARKER_MIN_SIDE_RATIO));
+    const maxSide = Math.max(24, Math.round(minDim * MARKER_MAX_SIDE_RATIO));
+
+    const candidates = [];
+    for (let i = 1; i < num; i += 1) {
+      const w = stats.intAt(i, 2);
+      const h = stats.intAt(i, 3);
+      const area = stats.intAt(i, 4);
+      if (area < minArea || area > maxArea) {
+        continue;
+      }
+      const rectWidth = Math.max(w, h);
+      const rectHeight = Math.min(w, h);
+      if (rectWidth < minSide || rectHeight < minSide || rectWidth > maxSide || rectHeight > maxSide) {
+        continue;
+      }
+
+      const aspect = rectWidth / Math.max(rectHeight, 1);
+      const fillRatio = area / Math.max(w * h, 1);
+      if (aspect < 0.62 || aspect > 1.62 || fillRatio < 0.42) {
+        continue;
+      }
+
+      const cx = centroids.doubleAt(i, 0);
+      const cy = centroids.doubleAt(i, 1);
+      const aspectSquare = rectHeight / Math.max(rectWidth, 1);
+      const squareScore = clamp(aspectSquare * fillRatio, 0, 1);
+
+      candidates.push({
+        area,
+        center: { x: cx, y: cy },
+        squareScore,
+      });
+    }
+
+    candidates.sort((a, b) => ((b.squareScore || 0) - (a.squareScore || 0)) || ((b.area || 0) - (a.area || 0)));
+
+    const unique = [];
+    const dedupeDistance = Math.max(14, Math.round(minDim * 0.02));
+    for (const candidate of candidates) {
+      const duplicate = unique.some((item) => distance(item.center, candidate.center) < dedupeDistance);
+      if (!duplicate) {
+        unique.push(candidate);
+      }
+      if (unique.length >= 20) {
+        break;
+      }
+    }
+
+    return unique;
+  } catch {
+    return [];
+  } finally {
+    labels.delete();
+    stats.delete();
+    centroids.delete();
+  }
+}
+
 function findMarkersMultiScale(grayMat) {
-  const scales = [1.0, 0.85, 0.7, 0.55, 0.42, 0.34];
+  // Multiescala: inclui upscaling leve para ajudar quando os marcadores ficam pequenos na foto.
+  const scales = [1.0, 1.25, 0.9, 0.75, 0.6, 0.45, 0.34];
   const candidates = [];
 
   for (const scale of scales) {
@@ -2051,7 +2154,8 @@ function findMarkersMultiScale(grayMat) {
           Math.max(1, Math.round(grayMat.cols * scale)),
           Math.max(1, Math.round(grayMat.rows * scale)),
         );
-        cv.resize(grayMat, scaled, size, 0, 0, cv.INTER_AREA);
+        const interpolation = scale < 1 ? cv.INTER_AREA : cv.INTER_LINEAR;
+        cv.resize(grayMat, scaled, size, 0, 0, interpolation);
       }
 
       cv.GaussianBlur(scaled, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
@@ -2097,10 +2201,11 @@ function findMarkersMultiScale(grayMat) {
   }
 
   // Dedupe no espaço original.
-  candidates.sort((a, b) => ((b.squareScore || 0) - (a.squareScore || 0)) || ((b.cornerScore || 0) - (a.cornerScore || 0)));
+  candidates.sort((a, b) => ((b.squareScore || 0) - (a.squareScore || 0)) || ((b.area || 0) - (a.area || 0)));
   const unique = [];
+  const dedupeDistance = Math.max(14, Math.round(Math.min(grayMat.cols, grayMat.rows) * 0.02));
   for (const candidate of candidates) {
-    const duplicate = unique.some((item) => distance(item.center, candidate.center) < 22);
+    const duplicate = unique.some((item) => distance(item.center, candidate.center) < dedupeDistance);
     if (!duplicate) {
       unique.push(candidate);
     }
@@ -2329,7 +2434,7 @@ function collectMarkerCandidatesV3(contours, width, height) {
   const minArea = frameArea * MARKER_MIN_AREA_RATIO;
   const maxArea = frameArea * MARKER_MAX_AREA_RATIO;
   const minDim = Math.min(width, height);
-  const minSide = Math.max(8, Math.round(minDim * MARKER_MIN_SIDE_RATIO));
+  const minSide = Math.max(6, Math.round(minDim * MARKER_MIN_SIDE_RATIO));
   const maxSide = Math.max(24, Math.round(minDim * MARKER_MAX_SIDE_RATIO));
 
   for (let index = 0; index < contours.size(); index += 1) {
@@ -2362,7 +2467,7 @@ function collectMarkerCandidatesV3(contours, width, height) {
       rectHeight < minSide ||
       rectWidth > maxSide ||
       rectHeight > maxSide ||
-      fillRatio < 0.50
+      fillRatio < 0.44
     ) {
       contour.delete();
       continue;
@@ -2374,7 +2479,7 @@ function collectMarkerCandidatesV3(contours, width, height) {
     const solidity = area / Math.max(hullArea, 1);
     hull.delete();
 
-    if (solidity < 0.72) {
+    if (solidity < 0.68) {
       contour.delete();
       continue;
     }
@@ -2399,8 +2504,8 @@ function collectMarkerCandidatesV3(contours, width, height) {
   }
 
   candidates.sort((left, right) => {
-    const leftScore = (left.squareScore || 0) * 10000 + (left.cornerScore || 0) * 1200 + Math.sqrt(left.area || 0);
-    const rightScore = (right.squareScore || 0) * 10000 + (right.cornerScore || 0) * 1200 + Math.sqrt(right.area || 0);
+    const leftScore = (left.squareScore || 0) * 10000 + Math.sqrt(left.area || 0);
+    const rightScore = (right.squareScore || 0) * 10000 + Math.sqrt(right.area || 0);
     return rightScore - leftScore;
   });
 
@@ -2532,9 +2637,8 @@ function validateCornerGeometry(orderedCorners, frameWidth, frameHeight) {
 
 function markerQualityScore(marker, width, height) {
   const square = clamp(Number(marker.squareScore || 0), 0, 1);
-  const corner = clamp(Number(marker.cornerScore || 0), 0, 1);
   const area = clamp(Math.sqrt(Number(marker.area || 0)) / Math.sqrt(Math.max(width * height, 1)), 0, 1);
-  return (square * 0.55) + (corner * 0.3) + (area * 0.15);
+  return (square * 0.78) + (area * 0.22);
 }
 
 function pickCornerMarkers(candidates, width, height) {
@@ -2542,65 +2646,69 @@ function pickCornerMarkers(candidates, width, height) {
     return { ok: false, reason: "markers_not_found", markers: [], corners: [], confidence: 0 };
   }
 
-  const imageCorners = {
-    tl: { x: 0, y: 0 },
-    tr: { x: width, y: 0 },
-    br: { x: width, y: height },
-    bl: { x: 0, y: height },
-  };
-  const diag = Math.hypot(width, height);
-  const proximityScore = (marker, corner) => {
-    const dist = distance(marker.center, corner);
-    return clamp(1 - (dist / Math.max(diag * 0.78, 1)), 0, 1);
-  };
+  const scored = candidates.map((marker, index) => ({
+    marker,
+    index,
+    quality: markerQualityScore(marker, width, height),
+  }));
 
-  const scored = candidates.map((marker, index) => {
-    const quality = markerQualityScore(marker, width, height);
-    return {
-      marker,
-      index,
-      quality,
-      tl: quality + (proximityScore(marker, imageCorners.tl) * 0.9),
-      tr: quality + (proximityScore(marker, imageCorners.tr) * 0.9),
-      br: quality + (proximityScore(marker, imageCorners.br) * 0.9),
-      bl: quality + (proximityScore(marker, imageCorners.bl) * 0.9),
-    };
-  });
+  scored.sort((a, b) =>
+    (b.quality - a.quality) ||
+    ((b.marker.squareScore || 0) - (a.marker.squareScore || 0)) ||
+    ((b.marker.area || 0) - (a.marker.area || 0))
+  );
 
-  const topFor = (key) => scored
-    .slice()
-    .sort((a, b) => (b[key] - a[key]))
-    .slice(0, 7);
-
-  const listTL = topFor("tl");
-  const listTR = topFor("tr");
-  const listBR = topFor("br");
-  const listBL = topFor("bl");
+  // Pool limitado para manter desempenho no mobile.
+  const pool = scored.slice(0, Math.min(18, scored.length));
 
   let best = null;
-  for (const tl of listTL) {
-    for (const tr of listTR) {
-      if (tr.index === tl.index) continue;
-      for (const br of listBR) {
-        if (br.index === tl.index || br.index === tr.index) continue;
-        for (const bl of listBL) {
-          if (bl.index === tl.index || bl.index === tr.index || bl.index === br.index) continue;
-          const quad = [tl.marker.center, tr.marker.center, br.marker.center, bl.marker.center];
-          const ordered = orderCorners(quad);
+  const minDim = Math.min(width, height);
+  const minDistLimit = minDim * 0.055;
+
+  for (let a = 0; a < pool.length - 3; a += 1) {
+    for (let b = a + 1; b < pool.length - 2; b += 1) {
+      for (let c = b + 1; c < pool.length - 1; c += 1) {
+        for (let d = c + 1; d < pool.length; d += 1) {
+          const combo = [pool[a], pool[b], pool[c], pool[d]];
+          const centers = combo.map((item) => item.marker.center);
+
+          // Evita escolher quadrados muito prÃ³ximos (ruÃ­do/texto).
+          let minDist = Infinity;
+          for (let i = 0; i < centers.length; i += 1) {
+            for (let j = i + 1; j < centers.length; j += 1) {
+              minDist = Math.min(minDist, distance(centers[i], centers[j]));
+            }
+          }
+          if (minDist < minDistLimit) {
+            continue;
+          }
+
+          // Marcadores reais tendem a ter Ã¡reas parecidas (mesma impressÃ£o). Evita combinaÃ§Ãµes com tamanhos muito discrepantes.
+          const areas = combo.map((item) => Number(item.marker.area || 0)).filter((value) => value > 0);
+          if (areas.length === 4) {
+            const minA = Math.min(areas[0], areas[1], areas[2], areas[3]);
+            const maxA = Math.max(areas[0], areas[1], areas[2], areas[3]);
+            if (minA > 0 && (maxA / minA) > 9) {
+              continue;
+            }
+          }
+
+          const ordered = orderCorners(centers);
           const validation = validateCornerGeometry(ordered, width, height);
-          if (!validation.ok) continue;
+          if (!validation.ok) {
+            continue;
+          }
 
-          const qualityAvg = (tl.quality + tr.quality + br.quality + bl.quality) / 4;
-          const proximityAvg = (
-            proximityScore(tl.marker, imageCorners.tl) +
-            proximityScore(tr.marker, imageCorners.tr) +
-            proximityScore(br.marker, imageCorners.br) +
-            proximityScore(bl.marker, imageCorners.bl)
-          ) / 4;
-
-          const score = validation.rectScore * (1 + (qualityAvg * 0.85)) * (1 + (proximityAvg * 0.7));
+          const qualityAvg = combo.reduce((sum, item) => sum + item.quality, 0) / 4;
+          const score = validation.rectScore * (1 + (qualityAvg * 1.25));
           if (!best || score > best.score) {
-            best = { score, rectScore: validation.rectScore, markers: [tl.marker, tr.marker, br.marker, bl.marker], corners: ordered };
+            best = {
+              score,
+              rectScore: validation.rectScore,
+              qualityAvg,
+              markers: combo.map((item) => item.marker),
+              corners: ordered,
+            };
           }
         }
       }
@@ -2610,8 +2718,22 @@ function pickCornerMarkers(candidates, width, height) {
   if (!best) {
     return { ok: false, reason: "bad_geometry", markers: [], corners: [], confidence: 0 };
   }
-  const confidence = clamp((best.rectScore - MIN_CARD_RECTANGLE_SCORE) / 0.2, 0, 1);
-  return { ok: true, markers: best.markers, corners: best.corners, rectScore: best.rectScore, confidence };
+
+  const rectConfidence = clamp(
+    (best.rectScore - MIN_CARD_RECTANGLE_SCORE) / Math.max(GOOD_CARD_RECTANGLE_SCORE - MIN_CARD_RECTANGLE_SCORE, 1e-6),
+    0,
+    1,
+  );
+  const confidence = clamp((rectConfidence * 0.75) + (best.qualityAvg * 0.25), 0, 1);
+
+  return {
+    ok: true,
+    markers: best.markers,
+    corners: best.corners,
+    rectScore: best.rectScore,
+    confidence,
+    qualityAvg: best.qualityAvg,
+  };
 }
 
 function warpCardImage(grayMat, orderedCorners) {
@@ -2621,10 +2743,30 @@ function warpCardImage(grayMat, orderedCorners) {
   const heightLeft = distance(tl, bl);
   const heightRight = distance(tr, br);
 
-  let targetWidth = Math.round((widthTop + widthBottom) / 2);
-  let targetHeight = Math.round((heightLeft + heightRight) / 2);
-  targetWidth = Math.max(360, Math.min(1400, targetWidth));
-  targetHeight = Math.max(520, Math.min(2000, targetHeight));
+  let targetWidth = Math.round(Math.max(widthTop, widthBottom));
+  let targetHeight = Math.round(Math.max(heightLeft, heightRight));
+  if (!Number.isFinite(targetWidth) || !Number.isFinite(targetHeight) || targetWidth < 10 || targetHeight < 10) {
+    return null;
+  }
+
+  // MantÃ©m proporÃ§Ã£o ao aplicar limites (evita "esticadas").
+  const MIN_W = 520;
+  const MIN_H = 760;
+  const MAX_W = 1600;
+  const MAX_H = 2400;
+
+  let scale = 1;
+  if (targetWidth < MIN_W || targetHeight < MIN_H) {
+    scale = Math.max(MIN_W / targetWidth, MIN_H / targetHeight);
+  } else if (targetWidth > MAX_W || targetHeight > MAX_H) {
+    scale = Math.min(MAX_W / targetWidth, MAX_H / targetHeight);
+  }
+  if (scale !== 1) {
+    targetWidth = Math.round(targetWidth * scale);
+    targetHeight = Math.round(targetHeight * scale);
+  }
+  targetWidth = Math.max(320, Math.min(MAX_W, targetWidth));
+  targetHeight = Math.max(480, Math.min(MAX_H, targetHeight));
 
   const targetAspect = targetWidth / Math.max(targetHeight, 1);
   const aspectError = Math.abs(targetAspect - MARKER_RECT_ASPECT) / Math.max(MARKER_RECT_ASPECT, 1e-6);
@@ -2702,6 +2844,26 @@ function measureFocus(grayMat) {
   mean.delete();
   stddev.delete();
   return score;
+}
+
+function normalizeIllumination(grayMat) {
+  // CorreÃ§Ã£o simples de iluminaÃ§Ã£o/sombras: normaliza pela "imagem de fundo" (blur grande).
+  // Ajuda quando o marcador fica pequeno e o threshold falha por causa de sombra/gradiente.
+  const minDim = Math.min(grayMat.cols, grayMat.rows);
+  const kernel = clamp(Math.round(minDim / 22) * 2 + 1, 21, 71);
+  const blurred = new cv.Mat();
+  const normalized = new cv.Mat();
+  try {
+    cv.GaussianBlur(grayMat, blurred, new cv.Size(kernel, kernel), 0, 0, cv.BORDER_DEFAULT);
+    cv.divide(grayMat, blurred, normalized, 255);
+    cv.normalize(normalized, normalized, 0, 255, cv.NORM_MINMAX);
+    return normalized;
+  } catch {
+    normalized.delete();
+    return null;
+  } finally {
+    blurred.delete();
+  }
 }
 
 function readAnswersFromWarped(warpedGray, questionCount, bounds) {
@@ -3160,7 +3322,7 @@ async function captureAndProcessPhoto() {
     return;
   }
 
-  const scale = Math.min(1, CARD_PROCESSING_MAX_WIDTH / Math.max(videoWidth, 1));
+  const scale = Math.min(1, PHOTO_PROCESSING_MAX_WIDTH / Math.max(videoWidth, 1));
   processingCanvas.width = Math.max(1, Math.round(videoWidth * scale));
   processingCanvas.height = Math.max(1, Math.round(videoHeight * scale));
   const ctx = processingCanvas.getContext("2d", { willReadFrequently: true });
