@@ -257,6 +257,8 @@ function initializeQrPage() {
     alignedCanvas: document.getElementById("aligned-preview"),
     backToQrButton: document.getElementById("back-to-qr"),
     debugToggle: document.getElementById("debug-toggle"),
+    debugFilePanel: document.getElementById("debug-file-panel"),
+    debugPhotoInput: document.getElementById("debug-photo-input"),
     openResultsButton: document.getElementById("open-results"),
   };
 
@@ -274,9 +276,20 @@ function initializeQrPage() {
   waitForOpenCv();
   setStatus("Aponte a camera apenas para o QR Code.");
   state.debug = Boolean(getQueryFlag("debug")) || Boolean(state.elements.debugToggle?.checked);
+  updateDebugUi();
   if (state.elements.debugToggle) {
     state.elements.debugToggle.addEventListener("change", () => {
       state.debug = Boolean(state.elements.debugToggle.checked);
+      updateDebugUi();
+    });
+  }
+  if (state.elements.debugPhotoInput && !state.elements.debugPhotoInput.dataset.wired) {
+    state.elements.debugPhotoInput.dataset.wired = "1";
+    state.elements.debugPhotoInput.addEventListener("change", async (event) => {
+      const file = event?.target?.files?.[0];
+      event.target.value = "";
+      if (!file) return;
+      await processPhotoFromFile(file);
     });
   }
 
@@ -314,15 +327,28 @@ function initializeCardPage() {
     answerGrid: document.getElementById("answer-grid"),
     resultPanel: document.getElementById("result-panel"),
     debugToggle: document.getElementById("debug-toggle"),
+    debugFilePanel: document.getElementById("debug-file-panel"),
+    debugPhotoInput: document.getElementById("debug-photo-input"),
   };
 
   wireCardButtons();
 
   waitForOpenCv();
   state.debug = Boolean(getQueryFlag("debug")) || Boolean(state.elements.debugToggle?.checked);
+  updateDebugUi();
   if (state.elements.debugToggle) {
     state.elements.debugToggle.addEventListener("change", () => {
       state.debug = Boolean(state.elements.debugToggle.checked);
+      updateDebugUi();
+    });
+  }
+  if (state.elements.debugPhotoInput && !state.elements.debugPhotoInput.dataset.wired) {
+    state.elements.debugPhotoInput.dataset.wired = "1";
+    state.elements.debugPhotoInput.addEventListener("change", async (event) => {
+      const file = event?.target?.files?.[0];
+      event.target.value = "";
+      if (!file) return;
+      await processPhotoFromFile(file);
     });
   }
   const stored = sessionStorage.getItem(STORAGE_KEY);
@@ -3294,6 +3320,100 @@ function resetReadingUi() {
   }
 }
 
+function handleCardDetectionFailure(detection) {
+  const reason = detection?.reason || "unknown";
+  if (reason === "markers_not_found") {
+    setWorkflowState(
+      "error",
+      "NÃ£o foi possÃ­vel identificar os quatro quadradinhos de alinhamento. Tire uma nova foto com o cartÃ£o inteiro visÃ­vel e boa iluminaÃ§Ã£o.",
+    );
+  } else if (reason === "low_confidence") {
+    setWorkflowState(
+      "error",
+      "Os marcadores foram encontrados, mas com baixa confianÃ§a. Certifique-se de que os 4 quadradinhos estÃ£o visÃ­veis (sem sombras) e tire uma nova foto.",
+    );
+  } else if (reason === "bad_geometry") {
+    setWorkflowState(
+      "error",
+      "Os marcadores foram encontrados, mas o cartÃ£o estÃ¡ muito inclinado ou parcialmente fora da imagem. Tire uma nova foto.",
+    );
+  } else if (reason === "blur") {
+    setWorkflowState(
+      "error",
+      "A foto ficou desfocada. Afaste um pouco o celular, estabilize e tire uma nova foto com boa iluminaÃ§Ã£o.",
+    );
+  } else {
+    setWorkflowState(
+      "error",
+      "NÃ£o foi possÃ­vel ler o cartÃ£o com confianÃ§a. Alinhe melhor e tire uma nova foto.",
+    );
+  }
+  updateCardControls();
+}
+
+async function processPhotoFromFile(file) {
+  if (!state.proof) {
+    setStatus("Nenhuma prova carregada.");
+    return;
+  }
+  if (!state.opencvReady) {
+    setStatus("OpenCV ainda estÃ¡ carregando.");
+    return;
+  }
+  if (!file) {
+    setStatus("Nenhuma foto selecionada.");
+    return;
+  }
+
+  resetReadingUi();
+  stopAnswerCamera();
+  setWorkflowState("answerScanning", "Processando fotoâ€¦");
+  updateCardControls();
+
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch (error) {
+    setWorkflowState("error", `NÃ£o foi possÃ­vel abrir a foto selecionada: ${error?.message || String(error)}`);
+    updateCardControls();
+    return;
+  }
+
+  try {
+    const scale = Math.min(1, PHOTO_PROCESSING_MAX_WIDTH / Math.max(bitmap.width, 1));
+    processingCanvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    processingCanvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const ctx = processingCanvas.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(bitmap, 0, 0, processingCanvas.width, processingCanvas.height);
+  } finally {
+    try {
+      bitmap.close?.();
+    } catch {
+      // ignore
+    }
+  }
+
+  let detection;
+  try {
+    detection = detectCardAnswersFromCanvas(processingCanvas, state.proof.quantidade_questoes);
+  } catch {
+    detection = { ok: false, reason: "unknown" };
+  }
+
+  if (!detection || detection.ok === false) {
+    handleCardDetectionFailure(detection);
+    return;
+  }
+
+  state.lastDetection = detection;
+  state.answers = { ...detection.answers };
+  updateRenderedAnswers();
+  drawAlignedPreview(detection.baseImageData);
+  correctProof();
+  setWorkflowState("answerDetected");
+  updateCardControls();
+}
+
 async function captureAndProcessPhoto() {
   if (!state.proof) {
     setStatus("Nenhuma prova carregada.");
@@ -3342,34 +3462,7 @@ async function captureAndProcessPhoto() {
   }
 
   if (!detection || detection.ok === false) {
-    const reason = detection?.reason || "unknown";
-    if (reason === "markers_not_found") {
-      setWorkflowState(
-        "error",
-        "Não foi possível identificar os quatro quadradinhos de alinhamento. Tire uma nova foto com o cartão inteiro visível e boa iluminação.",
-      );
-    } else if (reason === "low_confidence") {
-      setWorkflowState(
-        "error",
-        "Os marcadores foram encontrados, mas com baixa confiança. Certifique-se de que os 4 quadradinhos estão visíveis (sem sombras) e tire uma nova foto.",
-      );
-    } else if (reason === "bad_geometry") {
-      setWorkflowState(
-        "error",
-        "Os marcadores foram encontrados, mas o cartão está muito inclinado ou parcialmente fora da imagem. Tire uma nova foto.",
-      );
-    } else if (reason === "blur") {
-      setWorkflowState(
-        "error",
-        "A foto ficou desfocada. Afaste um pouco o celular, estabilize e tire uma nova foto com boa iluminação.",
-      );
-    } else {
-      setWorkflowState(
-        "error",
-        "Não foi possível ler o cartão com confiança. Alinhe melhor e tire uma nova foto.",
-      );
-    }
-    updateCardControls();
+    handleCardDetectionFailure(detection);
     return;
   }
 
@@ -3909,6 +4002,12 @@ function setWorkflowState(next, statusText) {
     error: "Erro",
   }[next] || next;
   setBadge(badgeText);
+}
+
+function updateDebugUi() {
+  if (state.elements?.debugFilePanel) {
+    state.elements.debugFilePanel.classList.toggle("hidden", !state.debug);
+  }
 }
 
 function updateCardControls() {
