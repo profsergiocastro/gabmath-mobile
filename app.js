@@ -1,11 +1,6 @@
 const QR_PAYLOAD_PREFIX = "GABMATH1:";
 const STORAGE_KEY = "gabmath-current-proof";
 const RESULTS_STORAGE_KEY = "gabmath-exam-results-v1";
-// Gate local (barreira simples, sem segurança real sem backend).
-const ACCESS_FLAG_KEY = "__gm_a";
-const ACCESS_FAIL_KEY = "__gm_f";
-const ACCESS_SALT = ["g", "m", "x", "2", ":", "K", "p"].join("");
-const ACCESS_HASH_B64 = ["dDncK2G3q1lO7Jxu/XnQ0dIjqk4y2TJUx8s9Kh9kXfc"].join("");
 const CARD_TARGET = {
   width: 820,
   height: 1160,
@@ -15,14 +10,15 @@ const CARD_TARGET = {
   bottomMarkerY: 1010,
 };
 const CARD_PROCESSING_MAX_WIDTH = 960;
-const PHOTO_PROCESSING_MAX_WIDTH = 1600;
+const PHOTO_PROCESSING_MAX_WIDTH = 2200;
+const PHOTO_PROCESSING_FALLBACK_MAX_WIDTH = 3600;
 const CARD_FRAME_INTERVAL_MS = 140;
 const MIN_FOCUS_SCORE = 120;
 const REQUIRED_STABLE_FRAMES = 4;
-// Score mÃ­nimo para aceitar o quadrilÃ¡tero dos 4 marcadores.
-// Valor mais baixo permite foto com o cartÃ£o mais distante (menor na imagem),
+// Score mínimo para aceitar o quadrilátero dos 4 marcadores.
+// Valor mais baixo permite foto com o cartão mais distante (menor na imagem),
 // mas ainda rejeita casos onde a geometria fica inconsistente.
-const MIN_CARD_RECTANGLE_SCORE = 0.03;
+const MIN_CARD_RECTANGLE_SCORE = 0.015;
 const GOOD_CARD_RECTANGLE_SCORE = 0.075;
 const MIN_MARKER_FILL_RATIO = 0.62;
 const MIN_MARKER_SIDE = 16;
@@ -34,17 +30,18 @@ const SECOND_BUBBLE_RELATIVE_LIMIT = 0.86;
 const BUBBLE_CONTRAST_MIN = 0.085;
 const BUBBLE_AMBIGUOUS_RELATIVE = 0.9;
 const BUBBLE_AMBIGUOUS_GAP = 0.035;
-// NÃ£o assumimos que o cartÃ£o esteja prÃ³ximo aos cantos da foto.
-// (O aluno pode fotografar mais distante e o cartÃ£o ficar centralizado.)
-// Mantido apenas por compatibilidade; nÃ£o usamos mais como fator de decisÃ£o.
+// Não assumimos que o cartão esteja próximo aos cantos da foto.
+// (O aluno pode fotografar mais distante e o cartão ficar centralizado.)
+// Mantido apenas por compatibilidade; não usamos mais como fator de decisão.
 const MARKER_CORNER_BONUS = 0.0;
 const CARD_ASPECT = CARD_TARGET.width / CARD_TARGET.height;
 const MARKER_RECT_ASPECT = (CARD_TARGET.rightMarkerX - CARD_TARGET.leftMarkerX) / Math.max((CARD_TARGET.bottomMarkerY - CARD_TARGET.topMarkerY), 1);
 
 // Marcadores (multiescala): aceitar quadrados pequenos (cartão longe) e grandes (cartão perto).
-const MARKER_MIN_AREA_RATIO = 0.000012;
+const MARKER_MIN_AREA_RATIO = 0.000006;
 const MARKER_MAX_AREA_RATIO = 0.015;
-const MARKER_MIN_SIDE_RATIO = 0.0045;
+// Permite marcadores menores quando a foto é tirada mais distante.
+const MARKER_MIN_SIDE_RATIO = 0.0028;
 const MARKER_MAX_SIDE_RATIO = 0.28;
 
 const state = {
@@ -61,6 +58,7 @@ const state = {
   cardMode: false,
   autoStartCardReading: false,
   debug: false,
+  lastPhotoMeta: null,
   workflow: "idle",
   qrProcessing: false,
   lastQrValue: "",
@@ -128,91 +126,7 @@ function createResultId() {
   return `r_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function hasResultsAccess() {
-  try {
-    return sessionStorage.getItem(ACCESS_FLAG_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-function setResultsAccess(ok) {
-  try {
-    if (ok) {
-      sessionStorage.setItem(ACCESS_FLAG_KEY, "1");
-    } else {
-      sessionStorage.removeItem(ACCESS_FLAG_KEY);
-    }
-  } catch {
-    // ignore
-  }
-}
-
-function getAccessFailState() {
-  try {
-    const raw = sessionStorage.getItem(ACCESS_FAIL_KEY);
-    if (!raw) return { count: 0, until: 0 };
-    const parsed = JSON.parse(raw);
-    return { count: Number(parsed?.count || 0), until: Number(parsed?.until || 0) };
-  } catch {
-    return { count: 0, until: 0 };
-  }
-}
-
-function setAccessFailState(next) {
-  try {
-    sessionStorage.setItem(ACCESS_FAIL_KEY, JSON.stringify(next));
-  } catch {
-    // ignore
-  }
-}
-
-function bytesToBase64(bytes) {
-  let binary = "";
-  const chunk = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-  }
-  return btoa(binary).replace(/=+$/g, "");
-}
-
-async function sha256Base64(text) {
-  const data = new TextEncoder().encode(text);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  return bytesToBase64(new Uint8Array(digest));
-}
-
-async function verifyAccessKey(typed) {
-  const normalized = String(typed || "").trim();
-  if (!normalized) return false;
-  try {
-    const hash = await sha256Base64(`${ACCESS_SALT}:${normalized}`);
-    return hash === ACCESS_HASH_B64;
-  } catch {
-    return false;
-  }
-}
-
-async function openResultsWithAccessCode() {
-  const now = Date.now();
-  const fail = getAccessFailState();
-  if (fail.until && now < fail.until) {
-    window.alert("Aguarde alguns segundos e tente novamente.");
-    return;
-  }
-
-  const typed = window.prompt("Digite a chave de acesso:", "");
-  const ok = await verifyAccessKey(typed);
-  if (!ok) {
-    const nextCount = fail.count + 1;
-    const penaltySeconds = nextCount >= 5 ? 20 : (nextCount >= 3 ? 8 : 0);
-    setAccessFailState({ count: nextCount, until: penaltySeconds ? (Date.now() + (penaltySeconds * 1000)) : 0 });
-    window.alert("Chave inválida.");
-    return;
-  }
-
-  setAccessFailState({ count: 0, until: 0 });
-  setResultsAccess(true);
+function openResultsPage() {
   window.location.href = "./resultados.html";
 }
 
@@ -251,6 +165,7 @@ function initializeQrPage() {
     confirmReadingButton: document.getElementById("confirm-reading"),
     cancelReadingButton: document.getElementById("cancel-reading"),
     disableCameraButton: document.getElementById("disable-camera"),
+    cardPhotoInput: document.getElementById("card-photo-input"),
     proofSummary: document.getElementById("proof-summary"),
     answerGrid: document.getElementById("answer-grid"),
     resultPanel: document.getElementById("result-panel"),
@@ -258,7 +173,6 @@ function initializeQrPage() {
     backToQrButton: document.getElementById("back-to-qr"),
     debugToggle: document.getElementById("debug-toggle"),
     debugFilePanel: document.getElementById("debug-file-panel"),
-    debugPhotoInput: document.getElementById("debug-photo-input"),
     openResultsButton: document.getElementById("open-results"),
   };
 
@@ -267,7 +181,7 @@ function initializeQrPage() {
   state.elements.loadProofButton.addEventListener("click", () => commitQrAndGo(state.elements.proofIdInput.value));
   wireCardButtons();
   if (state.elements.openResultsButton) {
-    state.elements.openResultsButton.addEventListener("click", openResultsWithAccessCode);
+    state.elements.openResultsButton.addEventListener("click", openResultsPage);
   }
   if (state.elements.backToQrButton) {
     state.elements.backToQrButton.addEventListener("click", backToQrMode);
@@ -283,9 +197,9 @@ function initializeQrPage() {
       updateDebugUi();
     });
   }
-  if (state.elements.debugPhotoInput && !state.elements.debugPhotoInput.dataset.wired) {
-    state.elements.debugPhotoInput.dataset.wired = "1";
-    state.elements.debugPhotoInput.addEventListener("change", async (event) => {
+  if (state.elements.cardPhotoInput && !state.elements.cardPhotoInput.dataset.wired) {
+    state.elements.cardPhotoInput.dataset.wired = "1";
+    state.elements.cardPhotoInput.addEventListener("change", async (event) => {
       const file = event?.target?.files?.[0];
       event.target.value = "";
       if (!file) return;
@@ -322,13 +236,13 @@ function initializeCardPage() {
     confirmReadingButton: document.getElementById("confirm-reading"),
     cancelReadingButton: document.getElementById("cancel-reading"),
     disableCameraButton: document.getElementById("disable-camera"),
+    cardPhotoInput: document.getElementById("card-photo-input"),
     proofSummary: document.getElementById("proof-summary"),
     scanStatus: document.getElementById("scan-status"),
     answerGrid: document.getElementById("answer-grid"),
     resultPanel: document.getElementById("result-panel"),
     debugToggle: document.getElementById("debug-toggle"),
     debugFilePanel: document.getElementById("debug-file-panel"),
-    debugPhotoInput: document.getElementById("debug-photo-input"),
   };
 
   wireCardButtons();
@@ -342,9 +256,9 @@ function initializeCardPage() {
       updateDebugUi();
     });
   }
-  if (state.elements.debugPhotoInput && !state.elements.debugPhotoInput.dataset.wired) {
-    state.elements.debugPhotoInput.dataset.wired = "1";
-    state.elements.debugPhotoInput.addEventListener("change", async (event) => {
+  if (state.elements.cardPhotoInput && !state.elements.cardPhotoInput.dataset.wired) {
+    state.elements.cardPhotoInput.dataset.wired = "1";
+    state.elements.cardPhotoInput.addEventListener("change", async (event) => {
       const file = event?.target?.files?.[0];
       event.target.value = "";
       if (!file) return;
@@ -363,21 +277,10 @@ function initializeCardPage() {
   renderAnswerGrid();
   setWorkflowState("waitingUserToStartAnswerScan");
   updateCardControls();
-  setStatus("Alinhe o celular com o cartão-resposta e toque em “Habilitar câmera”.");
+  setStatus('Alinhe o celular com o cartão-resposta e toque em "Tirar foto do cartão".');
 }
 
 async function initializeResultsPage() {
-  if (!hasResultsAccess()) {
-    const typed = window.prompt("Digite a chave de acesso:", "");
-    const ok = await verifyAccessKey(typed);
-    if (!ok) {
-      window.alert("Chave inválida.");
-      window.location.href = "./index.html";
-      return;
-    }
-    setResultsAccess(true);
-  }
-
   state.elements = {
     modeBadge: document.getElementById("mode-badge"),
     examSelect: document.getElementById("exam-select"),
@@ -392,6 +295,9 @@ async function initializeResultsPage() {
     exportJson: document.getElementById("export-json"),
     importJsonFile: document.getElementById("import-json-file"),
     importJsonButton: document.getElementById("import-json-button"),
+    deleteExamFilter: document.getElementById("delete-exam-filter"),
+    deleteExamList: document.getElementById("delete-exam-list"),
+    deleteExamsButton: document.getElementById("delete-exams-button"),
     studentDialog: document.getElementById("student-dialog"),
     studentDialogBody: document.getElementById("student-dialog-body"),
     closeStudentDialog: document.getElementById("close-student-dialog"),
@@ -455,7 +361,15 @@ async function initializeResultsPage() {
     });
   }
 
+  if (state.elements.deleteExamFilter) {
+    state.elements.deleteExamFilter.addEventListener("input", renderDeleteExamList);
+  }
+  if (state.elements.deleteExamsButton) {
+    state.elements.deleteExamsButton.addEventListener("click", deleteSelectedExamGroups);
+  }
+
   renderResultsPage();
+  renderDeleteExamList();
 }
 
 function getQueryParam(name) {
@@ -714,9 +628,100 @@ function saveExamName(examGroupId) {
   }
 }
 
+function renderDeleteExamList() {
+  if (!state.elements?.deleteExamList) {
+    return;
+  }
+
+  const store = loadResultsStore();
+  const groups = store.examGroups && typeof store.examGroups === "object" ? store.examGroups : {};
+  const query = String(state.elements.deleteExamFilter?.value || "").trim().toLowerCase();
+
+  const items = Object.values(groups)
+    .filter((group) => group && typeof group === "object")
+    .map((group) => ({
+      examGroupId: String(group.examGroupId || ""),
+      examName: String(group.examName || group.examGroupId || ""),
+      createdAtFromId: String(group.createdAtFromId || ""),
+      resultsCount: Array.isArray(group.results) ? group.results.length : 0,
+    }))
+    .filter((item) => Boolean(item.examGroupId))
+    .filter((item) => {
+      if (!query) return true;
+      const haystack = `${item.examGroupId} ${item.examName}`.toLowerCase();
+      return haystack.includes(query);
+    })
+    .sort((a, b) => a.examGroupId.localeCompare(b.examGroupId, "pt-BR"));
+
+  if (!items.length) {
+    state.elements.deleteExamList.innerHTML = "<div class=\"hint\">Nenhuma avaliação encontrada.</div>";
+    return;
+  }
+
+  state.elements.deleteExamList.innerHTML = items
+    .map((item) => {
+      const created = item.createdAtFromId ? ` (${escapeHtml(formatDateTime(item.createdAtFromId))})` : "";
+      return `
+        <label class="delete-item">
+          <input type="checkbox" class="delete-exam-checkbox" value="${escapeHtml(item.examGroupId)}">
+          <div>
+            <div><strong>${escapeHtml(item.examName)}</strong></div>
+            <div class="muted-cell">${escapeHtml(item.examGroupId)}${created}</div>
+            <div class="muted-cell">${escapeHtml(String(item.resultsCount))} aluno(s)</div>
+          </div>
+        </label>
+      `;
+    })
+    .join("");
+}
+
+function deleteSelectedExamGroups() {
+  if (!state.elements?.deleteExamList) {
+    return;
+  }
+
+  const checked = Array.from(state.elements.deleteExamList.querySelectorAll("input.delete-exam-checkbox:checked"))
+    .map((input) => String(input.value || "").trim())
+    .filter(Boolean);
+
+  if (!checked.length) {
+    alert("Selecione ao menos uma avaliação para excluir.");
+    return;
+  }
+
+  const store = loadResultsStore();
+  if (!store.examGroups || typeof store.examGroups !== "object") {
+    return;
+  }
+
+  const confirmed = window.confirm(
+    `Excluir ${checked.length} avaliação(ões) e todos os resultados salvos?\n\nEssa ação não pode ser desfeita.`
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  for (const examGroupId of checked) {
+    delete store.examGroups[examGroupId];
+  }
+  saveResultsStore(store);
+
+  // Recarrega para atualizar select, tabela e estatísticas.
+  window.location.href = "./resultados.html";
+}
+
 function recalculateQuestionStatus(marked, correct) {
   const value = String(marked || "").toUpperCase();
   const expected = String(correct || "").toUpperCase();
+  if (value === "__MULTIPLE__") {
+    return "multipla_marcacao";
+  }
+  if (value === "__AMBIGUOUS__") {
+    return "ambigua";
+  }
+  if (value === "__ANNULLED__") {
+    return "anulada";
+  }
   if (!value) {
     return "em_branco";
   }
@@ -729,37 +734,68 @@ function recalculateStudentResult(row, exam) {
     ? exam.questionIds
     : Object.keys(answerKey).sort((a, b) => a.localeCompare(b));
 
+  const previousMeta = row.questionMeta && typeof row.questionMeta === "object" ? row.questionMeta : {};
   const answers = { ...(row.answers || {}) };
   const questionStatus = {};
   const questionMeta = {};
 
   let correctCount = 0;
   let blankCount = 0;
+  let multipleCount = 0;
+  let ambiguousCount = 0;
+  let annulledCount = 0;
 
   for (const qid of questionIds) {
     const expected = String(answerKey[qid] || "").toUpperCase();
-    const marked = String(answers[qid] || "").toUpperCase();
-    const status = recalculateQuestionStatus(marked, expected);
+    const rawMarked = String(answers[qid] || "").trim().toUpperCase();
+    const status = recalculateQuestionStatus(rawMarked, expected);
+
+    let marcada = "";
+    let marcadas = [];
+    if (status === "correta" || status === "errada") {
+      marcada = rawMarked;
+      marcadas = rawMarked ? [rawMarked] : [];
+    } else if (status === "multipla_marcacao") {
+      marcadas = Array.isArray(previousMeta?.[qid]?.marcadas) ? previousMeta[qid].marcadas : [];
+      marcada = "";
+    } else if (status === "ambigua") {
+      marcadas = Array.isArray(previousMeta?.[qid]?.marcadas) ? previousMeta[qid].marcadas : [];
+      marcada = "";
+    } else {
+      marcada = "";
+      marcadas = [];
+    }
+
+    // Sanitiza answers: guarda apenas A-E quando houver resposta única.
+    answers[qid] = (status === "correta" || status === "errada") ? marcada : "";
+
     if (status === "correta") {
       correctCount += 1;
     } else if (status === "em_branco") {
       blankCount += 1;
+    } else if (status === "multipla_marcacao") {
+      multipleCount += 1;
+    } else if (status === "ambigua") {
+      ambiguousCount += 1;
+    } else if (status === "anulada") {
+      annulledCount += 1;
     }
     const numero = Number.parseInt(String(qid).replace(/^\D+/, ""), 10) || 0;
     questionStatus[qid] = status;
     questionMeta[qid] = {
       numero,
       correta: expected,
-      marcada: status === "em_branco" ? "" : marked,
-      marcadas: status === "em_branco" ? [] : [marked],
+      marcada,
+      marcadas,
       status,
     };
   }
 
   const total = questionIds.length;
-  const wrongCount = Math.max(0, total - correctCount - blankCount);
-  const calculatedScore = total ? Math.round((correctCount / total) * 1000) / 100 : 0;
-  const percentage = total ? Math.round((correctCount / total) * 10000) / 100 : 0;
+  const totalScored = Math.max(0, total - annulledCount);
+  const wrongCount = Math.max(0, totalScored - correctCount);
+  const calculatedScore = totalScored ? Math.round((correctCount / totalScored) * 1000) / 100 : 0;
+  const percentage = totalScored ? Math.round((correctCount / totalScored) * 10000) / 100 : 0;
 
   const manual = Boolean(row.manualScoreOverride);
   const score = manual ? (Number(row.score) || 0) : calculatedScore;
@@ -772,8 +808,9 @@ function recalculateStudentResult(row, exam) {
     correctCount,
     wrongCount,
     blankCount,
-    multipleCount: 0,
-    ambiguousCount: 0,
+    multipleCount,
+    ambiguousCount,
+    annulledCount,
     calculatedScore,
     percentage,
     score,
@@ -1285,7 +1322,7 @@ async function startCardCamera() {
     return;
   }
   setCameraPanelVisible(true);
-  setWorkflowState("waitingUserToStartAnswerScan", "Câmera aberta. Alinhe o cartão e toque em “Iniciar leitura”.");
+  setWorkflowState("waitingUserToStartAnswerScan", "Câmera aberta. Alinhe o cartão e tire uma foto.");
   updateCardControls();
 }
 
@@ -1458,7 +1495,7 @@ function enterCardMode(proof, { autoStart } = { autoStart: false }) {
     return;
   }
 
-  setStatus("Alinhe o celular com o cartão-resposta e toque em “Iniciar leitura”.");
+  setStatus('Alinhe o celular com o cartão-resposta e toque em "Tirar foto do cartão".');
 }
 
 function backToQrMode() {
@@ -1731,7 +1768,7 @@ function updateRenderedAnswers() {
 
 function startCardReading() {
   // Fluxo antigo (tempo real) foi substituído por captura de foto.
-  setStatus("Use o botão “Capturar foto” para fazer a leitura.");
+  setStatus('Use o botão "Tirar foto do cartão" para fazer a leitura.');
 }
 
 function stopAnswerReading() {
@@ -1745,18 +1782,40 @@ function stopAnswerReading() {
 function disableAnswerCamera() {
   stopAnswerReading();
   stopAnswerCamera();
-  setWorkflowState("waitingUserToStartAnswerScan", "Câmera desabilitada. Toque em “Habilitar câmera”.");
+  setWorkflowState("waitingUserToStartAnswerScan", 'Pronto. Toque em "Tirar foto do cartão" para capturar novamente.');
   updateCardControls();
 }
 
-async function enableAnswerCamera() {
-  if (state.stream) {
-    setCameraPanelVisible(true);
-    setWorkflowState("waitingUserToStartAnswerScan");
-    updateCardControls();
+function openCardPhotoPicker() {
+  const input = state.elements?.cardPhotoInput;
+  if (!input) {
+    setStatus("Captura de foto indisponível neste navegador.");
     return;
   }
-  await startCardCamera();
+  try {
+    input.value = "";
+  } catch {
+    // ignore
+  }
+  try {
+    input.click();
+  } catch (error) {
+    setStatus(`Não foi possível abrir a câmera: ${error?.message || String(error)}`);
+  }
+}
+
+async function enableAnswerCamera() {
+  if (!state.proof) {
+    setStatus("Nenhuma prova carregada.");
+    return;
+  }
+  if (!state.opencvReady) {
+    setStatus("OpenCV ainda está carregando.");
+    return;
+  }
+  setWorkflowState("waitingUserToStartAnswerScan");
+  updateCardControls();
+  openCardPhotoPicker();
 }
 
 function wireCardButtons() {
@@ -1953,11 +2012,31 @@ function detectCardAnswersFromCanvas(canvasElement, questionCount) {
     }
   }
 
+    // Reforça seleção: calcula contraste local (preto dentro, branco fora) por candidato.
+    // Ajuda a evitar falsos positivos (textos/bolhas/sombras) quando o cartão está distante.
+    const minDim = Math.min(canvasElement.width, canvasElement.height);
+    const maxOuter = clamp(Math.round(minDim * 0.14), 48, 220);
+    markers = markers.map((marker) => {
+      const area = Math.max(Number(marker.area || 0), 1);
+      const side = Math.sqrt(area);
+      const outerSize = clamp(Math.round(side * 2.2), 16, maxOuter);
+      const innerSize = clamp(Math.round(side * 0.9), 12, Math.max(12, outerSize - 4));
+      let contrastScore = 0;
+      try {
+        contrastScore = markerContrastScoreAt(gray, marker.center.x, marker.center.y, outerSize, innerSize);
+      } catch {
+        contrastScore = 0;
+      }
+      return { ...marker, contrastScore };
+    });
+
     const selection = pickCornerMarkers(markers, canvasElement.width, canvasElement.height);
     if (!selection.ok) {
       return { ok: false, reason: selection.reason || "markers_not_found", diagnostics: selection };
     }
-    if (selection.confidence < 0.12) {
+    // Não rejeitar cedo demais: em fotos distantes os marcadores ficam pequenos e o score cai.
+    // Preferimos tentar o warp e validar depois (warpValidation) antes de pedir nova foto.
+    if (selection.confidence < 0.045) {
       return { ok: false, reason: "low_confidence", diagnostics: selection };
     }
 
@@ -1974,24 +2053,36 @@ function detectCardAnswersFromCanvas(canvasElement, questionCount) {
   }
 
   const corners = selection.corners;
-  const warped = warpCardImage(gray, corners);
+  let warped = null;
+  try {
+    warped = perspectiveWarp(gray, corners);
+  } catch {
+    warped = null;
+  }
   if (!warped) {
     return { ok: false, reason: "bad_geometry", diagnostics: selection };
   }
+
+  const warpValidation = validateWarpedCardMarkers(warped);
+  if (!warpValidation.ok) {
+    warped.delete();
+    return { ok: false, reason: "warp_invalid", diagnostics: { ...selection, warpValidation } };
+  }
+
   const focusScore = measureFocus(warped);
   if (focusScore < MIN_FOCUS_SCORE * 0.65) {
     warped.delete();
     return { ok: false, reason: "blur" };
   }
 
-    const basePreview = new cv.Mat();
-    cv.cvtColor(warped, basePreview, cv.COLOR_GRAY2RGBA);
+  const basePreview = new cv.Mat();
+  cv.cvtColor(warped, basePreview, cv.COLOR_GRAY2RGBA);
 
   let reading;
   try {
-    reading = readAnswersFromWarpedV2(warped, questionCount, { leftX: 0, rightX: warped.cols, topY: 0, bottomY: warped.rows });
+    reading = readAnswersFromWarpedV2(warped, questionCount);
   } catch {
-    reading = readAnswersFromWarped(warped, questionCount, { leftX: 0, rightX: warped.cols, topY: 0, bottomY: warped.rows });
+    reading = readAnswersFromWarped(warped, questionCount);
   }
 
     const baseImageData = matToImageData(basePreview);
@@ -2009,7 +2100,17 @@ function detectCardAnswersFromCanvas(canvasElement, questionCount) {
     rows: reading.rows,
     baseImageData,
     focusScore,
-    diagnostics: { confidence: selection.confidence, rectScore: selection.rectScore ?? null },
+    inputSize: { width: canvasElement.width, height: canvasElement.height },
+    diagnostics: {
+      confidence: selection.confidence,
+      rectScore: selection.rectScore ?? null,
+      warpValidation: {
+        ok: warpValidation.ok,
+        avg: warpValidation.avg,
+        min: warpValidation.min,
+        scores: warpValidation.scores,
+      },
+    },
   };
   } finally {
     src.delete();
@@ -2076,7 +2177,7 @@ function findMarkersV2(binaryMat, width, height) {
     if (found.length >= 4) {
       return found;
     }
-    // Fallback: componentes conectados costuma ser mais tolerante quando o contorno fica "quebrado" por blur/ruÃ­do.
+    // Fallback: componentes conectados costuma ser mais tolerante quando o contorno fica "quebrado" por blur/ruído.
     const byComponents = collectMarkerCandidatesConnectedComponents(binaryMat, width, height);
     return byComponents.length >= 4 ? byComponents : found;
   } finally {
@@ -2104,7 +2205,7 @@ function collectMarkerCandidatesConnectedComponents(binaryMat, width, height) {
     const minArea = frameArea * MARKER_MIN_AREA_RATIO;
     const maxArea = frameArea * MARKER_MAX_AREA_RATIO;
     const minDim = Math.min(width, height);
-    const minSide = Math.max(6, Math.round(minDim * MARKER_MIN_SIDE_RATIO));
+    const minSide = Math.max(5, Math.round(minDim * MARKER_MIN_SIDE_RATIO));
     const maxSide = Math.max(24, Math.round(minDim * MARKER_MAX_SIDE_RATIO));
 
     const candidates = [];
@@ -2165,10 +2266,15 @@ function collectMarkerCandidatesConnectedComponents(binaryMat, width, height) {
 
 function findMarkersMultiScale(grayMat) {
   // Multiescala: inclui upscaling leve para ajudar quando os marcadores ficam pequenos na foto.
-  const scales = [1.0, 1.25, 0.9, 0.75, 0.6, 0.45, 0.34];
+  const baseMaxDim = Math.max(grayMat.cols, grayMat.rows, 1);
+  const MAX_WORK_DIM = 2500; // evita explosão de memória/CPU no mobile ao fazer upscaling
+  const scales = [1.0, 1.75, 1.5, 1.25, 0.9, 0.75, 0.6, 0.45, 0.34, 0.28];
   const candidates = [];
 
   for (const scale of scales) {
+    if (baseMaxDim * scale > MAX_WORK_DIM) {
+      continue;
+    }
     const scaled = new cv.Mat();
     const blur = new cv.Mat();
     const thresh = new cv.Mat();
@@ -2184,19 +2290,28 @@ function findMarkersMultiScale(grayMat) {
         cv.resize(grayMat, scaled, size, 0, 0, interpolation);
       }
 
-      cv.GaussianBlur(scaled, blur, new cv.Size(5, 5), 0, 0, cv.BORDER_DEFAULT);
+      // Blur adaptativo: blur grande pode "apagar" marcadores muito pequenos.
+      const blurK = scale <= 0.6 ? 3 : 5;
+      cv.GaussianBlur(scaled, blur, new cv.Size(blurK, blurK), 0, 0, cv.BORDER_DEFAULT);
 
       const thresholdAttempts = [
         () => cv.threshold(blur, thresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU),
+        () => cv.adaptiveThreshold(blur, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 21, 5),
         () => cv.adaptiveThreshold(blur, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 31, 7),
         () => cv.adaptiveThreshold(blur, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 51, 9),
+        () => cv.adaptiveThreshold(blur, thresh, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 71, 11),
       ];
 
       let markers = [];
       for (const applyThreshold of thresholdAttempts) {
         applyThreshold();
-        if (state.opencvKernel) {
-          cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
+        // Morfologia por escala: close para preencher falhas do contorno do marcador.
+        const morphK = scale >= 1.25 ? 5 : 3;
+        const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(morphK, morphK));
+        try {
+          cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, kernel);
+        } finally {
+          kernel.delete();
         }
         markers = findMarkersV2(thresh, scaled.cols, scaled.rows);
         if (markers.length < 4) {
@@ -2460,7 +2575,7 @@ function collectMarkerCandidatesV3(contours, width, height) {
   const minArea = frameArea * MARKER_MIN_AREA_RATIO;
   const maxArea = frameArea * MARKER_MAX_AREA_RATIO;
   const minDim = Math.min(width, height);
-  const minSide = Math.max(6, Math.round(minDim * MARKER_MIN_SIDE_RATIO));
+  const minSide = Math.max(5, Math.round(minDim * MARKER_MIN_SIDE_RATIO));
   const maxSide = Math.max(24, Math.round(minDim * MARKER_MAX_SIDE_RATIO));
 
   for (let index = 0; index < contours.size(); index += 1) {
@@ -2499,6 +2614,15 @@ function collectMarkerCandidatesV3(contours, width, height) {
       continue;
     }
 
+    // Evita confundir bolhas circulares preenchidas com marcadores quadrados.
+    // (círculo tende a ter circularidade ~1; quadrado ~pi/4 ≈ 0.785)
+    const perimeter = cv.arcLength(contour, true);
+    const circularity = (4 * Math.PI * area) / Math.max(perimeter * perimeter, 1e-6);
+    if (circularity > 0.945) {
+      contour.delete();
+      continue;
+    }
+
     const hull = new cv.Mat();
     cv.convexHull(contour, hull, false, true);
     const hullArea = cv.contourArea(hull);
@@ -2526,6 +2650,7 @@ function collectMarkerCandidatesV3(contours, width, height) {
       center,
       cornerScore,
       squareScore,
+      circularity,
     });
   }
 
@@ -2565,9 +2690,9 @@ function collectMarkerCandidatesV3(contours, width, height) {
               minDist = Math.min(minDist, distance(centers[i], centers[j]));
             }
           }
-          if (minDist < Math.min(width, height) * 0.06) {
-            continue;
-          }
+           if (minDist < Math.min(width, height) * 0.045) {
+             continue;
+           }
 
           const ordered = orderCorners(combo.map((item) => item.center));
           const rectScore = rectangleScore(ordered, width, height);
@@ -2654,7 +2779,7 @@ function validateCornerGeometry(orderedCorners, frameWidth, frameHeight) {
     distance(br, bl),
     distance(bl, tl),
   );
-  if (minDist < Math.min(frameWidth, frameHeight) * 0.06) {
+  if (minDist < Math.min(frameWidth, frameHeight) * 0.045) {
     reasons.push("marcadores_muito_proximos");
   }
 
@@ -2663,8 +2788,14 @@ function validateCornerGeometry(orderedCorners, frameWidth, frameHeight) {
 
 function markerQualityScore(marker, width, height) {
   const square = clamp(Number(marker.squareScore || 0), 0, 1);
+  const contrast = clamp(Number(marker.contrastScore || 0), 0, 1);
   const area = clamp(Math.sqrt(Number(marker.area || 0)) / Math.sqrt(Math.max(width * height, 1)), 0, 1);
-  return (square * 0.78) + (area * 0.22);
+  const circularityRaw = Number(marker.circularity);
+  const circularity = Number.isFinite(circularityRaw) ? clamp(circularityRaw, 0, 1) : 0.9;
+  // Penaliza formatos muito "circulares" (bolhas preenchidas). Quadrado tende a ~0.78; círculo ~1.0.
+  const circularityScore = clamp(1 - Math.max(0, circularity - 0.86) / 0.14, 0, 1);
+  // Peso de área menor: permite marcadores menores (foto mais distante) permanecerem no pool.
+  return (square * 0.64) + (contrast * 0.22) + (circularityScore * 0.11) + (area * 0.03);
 }
 
 function pickCornerMarkers(candidates, width, height) {
@@ -2689,7 +2820,7 @@ function pickCornerMarkers(candidates, width, height) {
 
   let best = null;
   const minDim = Math.min(width, height);
-  const minDistLimit = minDim * 0.055;
+  const minDistLimit = minDim * 0.042;
 
   for (let a = 0; a < pool.length - 3; a += 1) {
     for (let b = a + 1; b < pool.length - 2; b += 1) {
@@ -2698,7 +2829,7 @@ function pickCornerMarkers(candidates, width, height) {
           const combo = [pool[a], pool[b], pool[c], pool[d]];
           const centers = combo.map((item) => item.marker.center);
 
-          // Evita escolher quadrados muito prÃ³ximos (ruÃ­do/texto).
+          // Evita escolher quadrados muito próximos (ruído/texto).
           let minDist = Infinity;
           for (let i = 0; i < centers.length; i += 1) {
             for (let j = i + 1; j < centers.length; j += 1) {
@@ -2709,7 +2840,7 @@ function pickCornerMarkers(candidates, width, height) {
             continue;
           }
 
-          // Marcadores reais tendem a ter Ã¡reas parecidas (mesma impressÃ£o). Evita combinaÃ§Ãµes com tamanhos muito discrepantes.
+          // Marcadores reais tendem a ter áreas parecidas (mesma impressão). Evita combinações com tamanhos muito discrepantes.
           const areas = combo.map((item) => Number(item.marker.area || 0)).filter((value) => value > 0);
           if (areas.length === 4) {
             const minA = Math.min(areas[0], areas[1], areas[2], areas[3]);
@@ -2775,7 +2906,7 @@ function warpCardImage(grayMat, orderedCorners) {
     return null;
   }
 
-  // MantÃ©m proporÃ§Ã£o ao aplicar limites (evita "esticadas").
+  // Mantém proporção ao aplicar limites (evita "esticadas").
   const MIN_W = 520;
   const MIN_H = 760;
   const MAX_W = 1600;
@@ -2859,6 +2990,62 @@ function perspectiveWarp(grayMat, corners) {
   return warped;
 }
 
+function markerContrastScoreAt(grayMat, centerX, centerY, outerSize, innerSize) {
+  const outerHalf = Math.floor(outerSize / 2);
+  const innerHalf = Math.floor(innerSize / 2);
+
+  const outerX = clamp(Math.round(centerX) - outerHalf, 0, grayMat.cols - outerSize);
+  const outerY = clamp(Math.round(centerY) - outerHalf, 0, grayMat.rows - outerSize);
+  const innerX = clamp(Math.round(centerX) - innerHalf, 0, grayMat.cols - innerSize);
+  const innerY = clamp(Math.round(centerY) - innerHalf, 0, grayMat.rows - innerSize);
+
+  const outerRect = new cv.Rect(outerX, outerY, outerSize, outerSize);
+  const innerRect = new cv.Rect(innerX, innerY, innerSize, innerSize);
+  const outerRoi = grayMat.roi(outerRect);
+  const innerRoi = grayMat.roi(innerRect);
+
+  try {
+    const outerMean = cv.mean(outerRoi)[0];
+    const innerMean = cv.mean(innerRoi)[0];
+
+    const outer = Math.max(12, outerMean);
+    const contrast = clamp((outerMean - innerMean) / outer, 0, 1);
+    const darkness = clamp((255 - innerMean) / 255, 0, 1);
+    return clamp((contrast * 0.78) + (darkness * 0.22), 0, 1);
+  } finally {
+    outerRoi.delete();
+    innerRoi.delete();
+  }
+}
+
+function validateWarpedCardMarkers(warpedGray) {
+  const minDim = Math.min(warpedGray.cols, warpedGray.rows);
+  const outerSize = clamp(Math.round(minDim * 0.055), 30, 80);
+  const innerSize = clamp(Math.round(outerSize * 0.56), 18, outerSize - 4);
+
+  const points = [
+    { key: "tl", x: CARD_TARGET.leftMarkerX, y: CARD_TARGET.topMarkerY },
+    { key: "tr", x: CARD_TARGET.rightMarkerX, y: CARD_TARGET.topMarkerY },
+    { key: "br", x: CARD_TARGET.rightMarkerX, y: CARD_TARGET.bottomMarkerY },
+    { key: "bl", x: CARD_TARGET.leftMarkerX, y: CARD_TARGET.bottomMarkerY },
+  ];
+
+  const scores = {};
+  let sum = 0;
+  let min = 1;
+  for (const point of points) {
+    const score = markerContrastScoreAt(warpedGray, point.x, point.y, outerSize, innerSize);
+    scores[point.key] = score;
+    sum += score;
+    min = Math.min(min, score);
+  }
+
+  const avg = sum / 4;
+  // Conservador: se algum marcador ficou "claro" demais após o warp, rejeita a leitura.
+  const ok = avg >= 0.22 && min >= 0.14;
+  return { ok, avg, min, scores, outerSize, innerSize };
+}
+
 function measureFocus(grayMat) {
   const laplacian = new cv.Mat();
   const mean = new cv.Mat();
@@ -2873,7 +3060,7 @@ function measureFocus(grayMat) {
 }
 
 function normalizeIllumination(grayMat) {
-  // CorreÃ§Ã£o simples de iluminaÃ§Ã£o/sombras: normaliza pela "imagem de fundo" (blur grande).
+  // Correção simples de iluminação/sombras: normaliza pela "imagem de fundo" (blur grande).
   // Ajuda quando o marcador fica pequeno e o threshold falha por causa de sombra/gradiente.
   const minDim = Math.min(grayMat.cols, grayMat.rows);
   const kernel = clamp(Math.round(minDim / 22) * 2 + 1, 21, 71);
@@ -3284,6 +3471,13 @@ function correctProof() {
       threshold: item.threshold,
     }));
     const debugBundle = {
+      foto: state.lastPhotoMeta,
+      leitura: {
+        inputSize: state.lastDetection?.inputSize || null,
+        focusScore: state.lastDetection?.focusScore ?? null,
+        corners: state.lastDetection?.corners || null,
+        diagnostics: state.lastDetection?.diagnostics || null,
+      },
       pontos_corretos: yellowPoints,
       questoes: debugPayload,
     };
@@ -3308,6 +3502,7 @@ function resetReadingUi() {
   state.stableCount = 0;
   state.lastDetection = null;
   state.lastResult = null;
+  state.lastPhotoMeta = null;
   if (state.elements?.resultPanel) {
     state.elements.resultPanel.classList.add("hidden");
     state.elements.resultPanel.innerHTML = "";
@@ -3325,27 +3520,32 @@ function handleCardDetectionFailure(detection) {
   if (reason === "markers_not_found") {
     setWorkflowState(
       "error",
-      "NÃ£o foi possÃ­vel identificar os quatro quadradinhos de alinhamento. Tire uma nova foto com o cartÃ£o inteiro visÃ­vel e boa iluminaÃ§Ã£o.",
+      "Não foi possível identificar os quatro quadradinhos de alinhamento. Tire uma nova foto com o cartão inteiro visível e boa iluminação.",
     );
   } else if (reason === "low_confidence") {
     setWorkflowState(
       "error",
-      "Os marcadores foram encontrados, mas com baixa confianÃ§a. Certifique-se de que os 4 quadradinhos estÃ£o visÃ­veis (sem sombras) e tire uma nova foto.",
+      "Os marcadores foram encontrados, mas com baixa confiança. Certifique-se de que os 4 quadradinhos estão visíveis (sem sombras) e tire uma nova foto.",
+    );
+  } else if (reason === "warp_invalid") {
+    setWorkflowState(
+      "error",
+      "Os marcadores foram detectados, mas a correção de perspectiva não ficou confiável. Certifique-se de que os 4 quadradinhos estejam bem visíveis e tire uma nova foto com boa iluminação.",
     );
   } else if (reason === "bad_geometry") {
     setWorkflowState(
       "error",
-      "Os marcadores foram encontrados, mas o cartÃ£o estÃ¡ muito inclinado ou parcialmente fora da imagem. Tire uma nova foto.",
+      "Os marcadores foram encontrados, mas o cartão está muito inclinado ou parcialmente fora da imagem. Tire uma nova foto.",
     );
   } else if (reason === "blur") {
     setWorkflowState(
       "error",
-      "A foto ficou desfocada. Afaste um pouco o celular, estabilize e tire uma nova foto com boa iluminaÃ§Ã£o.",
+      "A foto ficou desfocada. Afaste um pouco o celular, estabilize e tire uma nova foto com boa iluminação.",
     );
   } else {
     setWorkflowState(
       "error",
-      "NÃ£o foi possÃ­vel ler o cartÃ£o com confianÃ§a. Alinhe melhor e tire uma nova foto.",
+      "Não foi possível ler o cartão com confiança. Alinhe melhor e tire uma nova foto.",
     );
   }
   updateCardControls();
@@ -3357,7 +3557,7 @@ async function processPhotoFromFile(file) {
     return;
   }
   if (!state.opencvReady) {
-    setStatus("OpenCV ainda estÃ¡ carregando.");
+    setStatus("OpenCV ainda está carregando.");
     return;
   }
   if (!file) {
@@ -3367,35 +3567,123 @@ async function processPhotoFromFile(file) {
 
   resetReadingUi();
   stopAnswerCamera();
-  setWorkflowState("answerScanning", "Processando fotoâ€¦");
+  setWorkflowState("answerScanning", "Processando foto…");
   updateCardControls();
 
   let bitmap;
   try {
-    bitmap = await createImageBitmap(file);
+    try {
+      bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+    } catch {
+      bitmap = await createImageBitmap(file);
+    }
   } catch (error) {
-    setWorkflowState("error", `NÃ£o foi possÃ­vel abrir a foto selecionada: ${error?.message || String(error)}`);
+    setWorkflowState("error", `Não foi possível abrir a foto selecionada: ${error?.message || String(error)}`);
     updateCardControls();
     return;
   }
 
-  try {
-    const scale = Math.min(1, PHOTO_PROCESSING_MAX_WIDTH / Math.max(bitmap.width, 1));
-    processingCanvas.width = Math.max(1, Math.round(bitmap.width * scale));
-    processingCanvas.height = Math.max(1, Math.round(bitmap.height * scale));
-    const ctx = processingCanvas.getContext("2d", { willReadFrequently: true });
-    ctx.drawImage(bitmap, 0, 0, processingCanvas.width, processingCanvas.height);
-  } finally {
-    try {
-      bitmap.close?.();
-    } catch {
-      // ignore
-    }
-  }
-
   let detection;
   try {
-    detection = detectCardAnswersFromCanvas(processingCanvas, state.proof.quantidade_questoes);
+    state.lastPhotoMeta = {
+      original: { width: bitmap.width, height: bitmap.height },
+      attempts: [],
+    };
+
+    const drawBitmapToCanvas = (maxDimension, rotationSteps = 0) => {
+      const maxDim = Math.max(bitmap.width, bitmap.height, 1);
+      const safeMax = clamp(maxDimension, 720, 3600);
+      const scale = Math.min(1, safeMax / maxDim);
+      const targetWidth = Math.max(1, Math.round(bitmap.width * scale));
+      const targetHeight = Math.max(1, Math.round(bitmap.height * scale));
+      const rotation = ((rotationSteps % 4) + 4) % 4;
+
+      processingCanvas.width = rotation % 2 === 0 ? targetWidth : targetHeight;
+      processingCanvas.height = rotation % 2 === 0 ? targetHeight : targetWidth;
+      const ctx = processingCanvas.getContext("2d", { willReadFrequently: true });
+      ctx.imageSmoothingEnabled = true;
+      try {
+        ctx.imageSmoothingQuality = "high";
+      } catch {
+        // ignore
+      }
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, processingCanvas.width, processingCanvas.height);
+      ctx.save();
+      if (rotation === 0) {
+        ctx.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
+      } else if (rotation === 1) {
+        // 90° CW
+        ctx.translate(processingCanvas.width, 0);
+        ctx.rotate(Math.PI / 2);
+        ctx.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
+      } else if (rotation === 2) {
+        // 180°
+        ctx.translate(processingCanvas.width, processingCanvas.height);
+        ctx.rotate(Math.PI);
+        ctx.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
+      } else {
+        // 270° CW
+        ctx.translate(0, processingCanvas.height);
+        ctx.rotate(-Math.PI / 2);
+        ctx.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
+      }
+      ctx.restore();
+
+      return { scale, rotation, targetWidth: processingCanvas.width, targetHeight: processingCanvas.height };
+    };
+
+    const shouldRetryHigherRes = (result) => {
+      const reason = result?.reason || "unknown";
+      return reason === "markers_not_found" || reason === "low_confidence" || reason === "bad_geometry" || reason === "warp_invalid";
+    };
+
+    try {
+      const questionCount = state.proof.quantidade_questoes;
+      const rotations = [0, 1, 2, 3];
+
+      const runAttempt = (maxDimension, rotationSteps) => {
+        const meta = drawBitmapToCanvas(maxDimension, rotationSteps);
+        const result = detectCardAnswersFromCanvas(processingCanvas, questionCount);
+        state.lastPhotoMeta.attempts.push({
+          maxDimension,
+          rotationSteps: meta.rotation,
+          canvasWidth: meta.targetWidth,
+          canvasHeight: meta.targetHeight,
+          scale: meta.scale,
+          ok: result?.ok === true,
+          reason: result?.ok === false ? (result.reason || "unknown") : null,
+        });
+        return result;
+      };
+
+      // 1) Tentativa padrão (mais rápida): tenta rotações se necessário (alguns navegadores ignoram EXIF).
+      for (const rotationSteps of rotations) {
+        detection = runAttempt(PHOTO_PROCESSING_MAX_WIDTH, rotationSteps);
+        if (detection?.ok === true || !shouldRetryHigherRes(detection)) {
+          break;
+        }
+      }
+
+      // 2) Fallback: mais resolução para fotos distantes (marcadores pequenos).
+      if (detection?.ok !== true && shouldRetryHigherRes(detection)) {
+        const maxDim = Math.max(bitmap.width, bitmap.height, 1);
+        if (PHOTO_PROCESSING_FALLBACK_MAX_WIDTH > PHOTO_PROCESSING_MAX_WIDTH && maxDim > PHOTO_PROCESSING_MAX_WIDTH * 1.05) {
+          for (const rotationSteps of rotations) {
+            detection = runAttempt(PHOTO_PROCESSING_FALLBACK_MAX_WIDTH, rotationSteps);
+            if (detection?.ok === true || !shouldRetryHigherRes(detection)) {
+              break;
+            }
+          }
+        }
+      }
+    } finally {
+      try {
+        bitmap.close?.();
+      } catch {
+        // ignore
+      }
+    }
   } catch {
     detection = { ok: false, reason: "unknown" };
   }
@@ -3415,69 +3703,14 @@ async function processPhotoFromFile(file) {
 }
 
 async function captureAndProcessPhoto() {
-  if (!state.proof) {
-    setStatus("Nenhuma prova carregada.");
-    return;
-  }
-  if (!state.opencvReady) {
-    setStatus("OpenCV ainda está carregando.");
-    return;
-  }
-  if (!state.stream || !state.elements.video?.srcObject) {
-    setStatus("Habilite a câmera antes de capturar a foto.");
-    return;
-  }
-
-  resetReadingUi();
-  setWorkflowState("answerScanning", "Capturando foto…");
-  updateCardControls();
-
-  // Captura frame estático do preview.
-  const video = state.elements.video;
-  const videoWidth = video.videoWidth || 0;
-  const videoHeight = video.videoHeight || 0;
-  if (videoWidth < 120 || videoHeight < 120) {
-    setWorkflowState("error", "Vídeo ainda não está pronto. Tente novamente.");
-    updateCardControls();
-    return;
-  }
-
-  const scale = Math.min(1, PHOTO_PROCESSING_MAX_WIDTH / Math.max(videoWidth, 1));
-  processingCanvas.width = Math.max(1, Math.round(videoWidth * scale));
-  processingCanvas.height = Math.max(1, Math.round(videoHeight * scale));
-  const ctx = processingCanvas.getContext("2d", { willReadFrequently: true });
-  ctx.drawImage(video, 0, 0, processingCanvas.width, processingCanvas.height);
-
-  // Fecha o preview para evitar travas durante o processamento.
-  stopAnswerCamera();
-
-  setWorkflowState("answerScanning", "Processando foto…");
-  updateCardControls();
-
-  let detection;
-  try {
-    detection = detectCardAnswersFromCanvas(processingCanvas, state.proof.quantidade_questoes);
-  } catch {
-    detection = { ok: false, reason: "unknown" };
-  }
-
-  if (!detection || detection.ok === false) {
-    handleCardDetectionFailure(detection);
-    return;
-  }
-
-  state.lastDetection = detection;
-  state.answers = { ...detection.answers };
-  updateRenderedAnswers();
-  drawAlignedPreview(detection.baseImageData);
-  correctProof();
-  setWorkflowState("answerDetected");
-  updateCardControls();
+  // Mantido por compatibilidade (card.html antigo).
+  // No fluxo atual, a captura é feita via câmera nativa pelo input file.
+  await enableAnswerCamera();
 }
 
 function retakePhoto() {
   resetReadingUi();
-  setWorkflowState("waitingUserToStartAnswerScan", "Toque em “Habilitar câmera” e alinhe o cartão.");
+  setWorkflowState("waitingUserToStartAnswerScan", 'Toque em "Tirar foto do cartão" para capturar novamente.');
   updateCardControls();
   enableAnswerCamera();
 }
@@ -3515,7 +3748,7 @@ function confirmReading() {
 function cancelReading() {
   resetReadingUi();
   stopAnswerCamera();
-  setWorkflowState("waitingUserToStartAnswerScan", "Leitura cancelada. Toque em “Habilitar câmera” para tentar novamente.");
+  setWorkflowState("waitingUserToStartAnswerScan", 'Leitura cancelada. Toque em "Tirar foto do cartão" para tentar novamente.');
   updateCardControls();
 }
 
@@ -4016,25 +4249,26 @@ function updateCardControls() {
     return;
   }
 
-  const cameraEnabled = Boolean(state.stream && state.elements.video?.srcObject);
   const scanning = state.workflow === "answerScanning";
-  const photoMode = true;
   const photoReady = state.workflow === "answerDetected";
 
-  setCameraPanelVisible(cameraEnabled);
+  // Para máxima estabilidade no celular, usamos captura por foto via câmera nativa (input file).
+  // Não mantemos preview interno aberto durante a leitura do cartão.
+  setCameraPanelVisible(false);
 
   // Novo layout (index.html atualizado)
   if (state.elements?.enableCameraButton) {
-    state.elements.enableCameraButton.classList.toggle("hidden", cameraEnabled);
+    state.elements.enableCameraButton.classList.toggle("hidden", scanning || photoReady);
     state.elements.enableCameraButton.disabled = scanning || !state.opencvReady;
 
     if (state.elements.capturePhotoButton) {
-      state.elements.capturePhotoButton.classList.toggle("hidden", !cameraEnabled || scanning || photoReady);
-      state.elements.capturePhotoButton.disabled = scanning || !cameraEnabled;
+      // Fluxo antigo (preview interno) desativado.
+      state.elements.capturePhotoButton.classList.add("hidden");
+      state.elements.capturePhotoButton.disabled = true;
     }
 
     if (state.elements.retakePhotoButton) {
-      state.elements.retakePhotoButton.classList.toggle("hidden", scanning || (!photoReady && cameraEnabled));
+      state.elements.retakePhotoButton.classList.toggle("hidden", scanning || !photoReady);
       state.elements.retakePhotoButton.disabled = scanning;
     }
 
@@ -4044,18 +4278,14 @@ function updateCardControls() {
     }
 
     if (state.elements.cancelReadingButton) {
-      const showCancel = photoReady || cameraEnabled || scanning;
+      const showCancel = photoReady || scanning;
       state.elements.cancelReadingButton.classList.toggle("hidden", !showCancel);
       state.elements.cancelReadingButton.disabled = false;
     }
 
     if (state.elements.disableCameraButton) {
-      state.elements.disableCameraButton.classList.toggle("hidden", !cameraEnabled || scanning || photoReady);
-      state.elements.disableCameraButton.disabled = scanning;
-    }
-
-    if (cameraEnabled && !scanning && !photoReady) {
-      drawAnswerGuide();
+      state.elements.disableCameraButton.classList.add("hidden");
+      state.elements.disableCameraButton.disabled = true;
     }
     return;
   }

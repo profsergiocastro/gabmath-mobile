@@ -41,30 +41,23 @@
       <div id="step-card" class="step hidden">
         <h2>Cartão-resposta</h2>
         <div id="proof-summary" class="summary"></div>
-        <p class="hint">Alinhe os quatro quadradinhos pretos do cartão-resposta com as marcações da grade e toque em “Capturar foto”.</p>
+        <p class="hint">Tire uma foto do cartão-resposta com os quatro quadradinhos pretos visíveis e boa iluminação.</p>
         <div class="actions single-column">
-          <button id="enable-camera" class="full">Habilitar câmera</button>
-          <button id="capture-photo" class="full hidden">Capturar foto</button>
+          <button id="enable-camera" class="full">Tirar foto do cartão</button>
           <button id="retake-photo" class="secondary full hidden">Tirar nova foto</button>
-          <button id="confirm-reading" class="full hidden">Confirmar e salvar resultado</button>
           <button id="cancel-reading" class="secondary full hidden">Cancelar</button>
-          <button id="disable-camera" class="secondary full hidden">Desabilitar câmera</button>
         </div>
+        <input id="card-photo-input" class="file-input-hidden" type="file" accept="image/*" capture="environment">
         <label class="debug-toggle">
           <input id="debug-toggle" type="checkbox">
           Modo diagnóstico da leitura
         </label>
-        <div id="debug-file-panel" class="hidden">
-          <label class="field">
-            <span>Modo diagnÃ³stico: testar com foto do arquivo</span>
-            <input id="debug-photo-input" type="file" accept="image/*">
-          </label>
-        </div>
         <p id="card-status" class="status"></p>
         <canvas id="aligned-preview" class="aligned-preview"></canvas>
         <div id="answer-grid" class="answer-grid"></div>
         <div id="result-panel" class="result hidden"></div>
         <div class="actions single-column">
+          <button id="confirm-reading" class="full hidden">Confirmar e salvar resultado</button>
           <button id="back-to-qr" class="secondary full">Ler outro QR</button>
           <a class="button-link secondary-link" href="./resultados.html">Resultados da prova</a>
         </div>

@@ -90,6 +90,17 @@
           <button id="import-json-button" class="full">Importar e mesclar resultados</button>
         </div>
 
+        <h2 style="margin-top: 18px;">Excluir provas</h2>
+        <p class="hint">Isso remove avaliações e resultados salvos neste navegador. Essa ação não pode ser desfeita.</p>
+        <label class="field" style="margin-top: 10px;">
+          <span>Filtrar (turma/trecho do ID)</span>
+          <input id="delete-exam-filter" type="text" placeholder="Ex.: turma-01">
+        </label>
+        <div id="delete-exam-list" class="delete-list"></div>
+        <div class="actions single-column" style="margin-top: 0;">
+          <button id="delete-exams-button" class="secondary full">Excluir selecionadas</button>
+        </div>
+
         <dialog id="student-dialog" class="student-dialog">
           <div id="student-dialog-body"></div>
           <div class="actions single-column">

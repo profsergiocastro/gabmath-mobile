@@ -71,6 +71,16 @@ h2 {
   display: none;
 }
 
+.file-input-hidden {
+  position: absolute;
+  left: -9999px;
+  top: auto;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
 .camera-stack {
   position: relative;
   border-radius: 16px;
@@ -378,4 +388,40 @@ button.full {
 .question-line.annulled {
   border-color: #ffe8a3;
   background: #fff7da;
+}
+
+.delete-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid #d4e0eb;
+  border-radius: 14px;
+  background: #fff;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.delete-item {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px;
+  border: 1px solid #edf3f8;
+  border-radius: 12px;
+  background: #f9fbfd;
+}
+
+.delete-item input {
+  margin-top: 2px;
+}
+
+.delete-item .delete-title {
+  font-weight: 700;
+}
+
+.delete-item .delete-sub {
+  color: #5c6b7a;
+  font-size: 0.88rem;
+  word-break: break-word;
 }
