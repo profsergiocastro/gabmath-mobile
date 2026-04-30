@@ -390,6 +390,14 @@ button.full {
   background: #fff7da;
 }
 
+.question-stat {
+  cursor: pointer;
+}
+
+.question-stat:hover {
+  filter: brightness(0.99);
+}
+
 .delete-list {
   display: grid;
   gap: 10px;

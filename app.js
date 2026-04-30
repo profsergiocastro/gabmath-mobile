@@ -1,6 +1,7 @@
 const QR_PAYLOAD_PREFIX = "GABMATH1:";
 const STORAGE_KEY = "gabmath-current-proof";
 const RESULTS_STORAGE_KEY = "gabmath-exam-results-v1";
+const QUESTION_BANK_STORAGE_KEY = "gabmath-question-bank-v1";
 const CARD_TARGET = {
   width: 820,
   height: 1160,
@@ -304,6 +305,9 @@ async function initializeResultsPage() {
     exportJson: document.getElementById("export-json"),
     importJsonFile: document.getElementById("import-json-file"),
     importJsonButton: document.getElementById("import-json-button"),
+    importQuestionsFile: document.getElementById("import-questions-file"),
+    importQuestionsButton: document.getElementById("import-questions-button"),
+    clearQuestionsButton: document.getElementById("clear-questions-button"),
     deleteExamFilter: document.getElementById("delete-exam-filter"),
     deleteExamList: document.getElementById("delete-exam-list"),
     deleteExamsButton: document.getElementById("delete-exams-button"),
@@ -314,6 +318,9 @@ async function initializeResultsPage() {
     editDialogBody: document.getElementById("edit-dialog-body"),
     saveEditDialog: document.getElementById("save-edit-dialog"),
     cancelEditDialog: document.getElementById("cancel-edit-dialog"),
+    questionDialog: document.getElementById("question-dialog"),
+    questionDialogBody: document.getElementById("question-dialog-body"),
+    closeQuestionDialog: document.getElementById("close-question-dialog"),
   };
 
   setBadge("Resultados");
@@ -352,7 +359,19 @@ async function initializeResultsPage() {
   if (state.elements.importJsonButton) {
     state.elements.importJsonButton.addEventListener("click", importResultsFromJsonFile);
   }
+  if (state.elements.importQuestionsButton) {
+    state.elements.importQuestionsButton.addEventListener("click", importQuestionBankFromJsonFile);
+  }
+  if (state.elements.clearQuestionsButton) {
+    state.elements.clearQuestionsButton.addEventListener("click", clearImportedQuestionBank);
+  }
+  if (state.elements.questionStats) {
+    state.elements.questionStats.addEventListener("click", handleQuestionStatsClick);
+  }
   state.elements.closeStudentDialog.addEventListener("click", () => state.elements.studentDialog.close());
+  if (state.elements.closeQuestionDialog) {
+    state.elements.closeQuestionDialog.addEventListener("click", () => state.elements.questionDialog?.close());
+  }
   if (state.elements.cancelEditDialog) {
     state.elements.cancelEditDialog.addEventListener("click", () => state.elements.editDialog.close());
   }
@@ -571,7 +590,11 @@ function openStudentDetails(examGroupId, resultId) {
   lines.push(`<div><strong>Acertos:</strong> ${Number(row.correctCount || 0)} | <strong>Erros:</strong> ${Number(row.wrongCount || 0)}</div>`);
   lines.push(`<div><strong>Correção:</strong> ${escapeHtml(formatDateTime(row.correctedAt))}</div>`);
 
-  for (const qid of exam.questionIds || []) {
+  const qids = Array.isArray(row.questionIds) && row.questionIds.length
+    ? row.questionIds.map((value) => String(value))
+    : Object.keys(row.questionMeta || {}).sort((a, b) => a.localeCompare(b));
+
+  for (const qid of qids) {
     const meta = row.questionMeta?.[qid] || {};
     const status = String(meta.status || "em_branco");
     const css = status === "correta" ? "correct" : (status === "em_branco" ? "blank" : (status === "anulada" ? "annulled" : "wrong"));
@@ -738,10 +761,14 @@ function recalculateQuestionStatus(marked, correct) {
 }
 
 function recalculateStudentResult(row, exam) {
-  const answerKey = exam.answerKey || {};
-  const questionIds = Array.isArray(exam.questionIds) && exam.questionIds.length
-    ? exam.questionIds
-    : Object.keys(answerKey).sort((a, b) => a.localeCompare(b));
+  const rowKey = row?.answerKey;
+  const answerKey = rowKey && typeof rowKey === "object" ? rowKey : (exam.answerKey || {});
+  const rowIds = row?.questionIds;
+  const questionIds = Array.isArray(rowIds) && rowIds.length
+    ? rowIds.map((value) => String(value))
+    : (Array.isArray(exam.questionIds) && exam.questionIds.length
+      ? exam.questionIds.map((value) => String(value))
+      : Object.keys(answerKey).sort((a, b) => a.localeCompare(b)));
 
   const previousMeta = row.questionMeta && typeof row.questionMeta === "object" ? row.questionMeta : {};
   const answers = { ...(row.answers || {}) };
@@ -840,9 +867,11 @@ function openEditStudentResult(examGroupId, resultId) {
 
   state.editing = { examGroupId, resultId };
 
-  const qids = Array.isArray(exam.questionIds) && exam.questionIds.length
-    ? exam.questionIds
-    : Object.keys(exam.answerKey || {}).sort((a, b) => a.localeCompare(b));
+  const qids = Array.isArray(row.questionIds) && row.questionIds.length
+    ? row.questionIds.map((value) => String(value))
+    : (Array.isArray(exam.questionIds) && exam.questionIds.length
+      ? exam.questionIds.map((value) => String(value))
+      : Object.keys(row.answerKey || exam.answerKey || {}).sort((a, b) => a.localeCompare(b)));
 
   const manual = Boolean(row.manualScoreOverride);
   const scoreValue = manual ? Number(row.score || 0) : Number(row.calculatedScore ?? row.score ?? 0);
@@ -867,7 +896,7 @@ function openEditStudentResult(examGroupId, resultId) {
 
   lines.push(`<h3 style="margin:14px 0 6px;">Respostas</h3>`);
   for (const qid of qids) {
-    const expected = String(exam.answerKey?.[qid] || "").toUpperCase();
+    const expected = String(row.answerKey?.[qid] || exam.answerKey?.[qid] || "").toUpperCase();
     const current = String(row.answers?.[qid] || "").toUpperCase();
     const status = recalculateQuestionStatus(current, expected);
     const css = status === "correta" ? "correct" : (status === "em_branco" ? "blank" : "wrong");
@@ -1016,7 +1045,7 @@ function saveEditedStudentResult() {
   renderResultsPage();
 }
 
-function calculateQuestionStats(exam, results) {
+function calculateQuestionStatsLegacy(exam, results) {
   const stats = [];
   const questionIds = exam.questionIds || [];
   for (const qid of questionIds) {
@@ -1069,6 +1098,86 @@ function calculateQuestionStats(exam, results) {
   return stats;
 }
 
+function calculateQuestionStats(exam, results) {
+  const statsById = new Map();
+
+  const compareQuestionId = (left, right) => {
+    const a = String(left || "");
+    const b = String(right || "");
+    const na = Number.parseInt(a.replace(/[^\d]/g, ""), 10);
+    const nb = Number.parseInt(b.replace(/[^\d]/g, ""), 10);
+    if (Number.isFinite(na) && Number.isFinite(nb) && na !== nb) {
+      return na - nb;
+    }
+    return a.localeCompare(b, "pt-BR");
+  };
+
+  const getRowQuestionIds = (row) => {
+    if (Array.isArray(row?.questionIds) && row.questionIds.length) {
+      return row.questionIds.map((value) => String(value));
+    }
+    if (row?.questionStatus && typeof row.questionStatus === "object") {
+      return Object.keys(row.questionStatus);
+    }
+    if (row?.questionMeta && typeof row.questionMeta === "object") {
+      return Object.keys(row.questionMeta);
+    }
+    if (row?.answerKey && typeof row.answerKey === "object") {
+      return Object.keys(row.answerKey);
+    }
+    return [];
+  };
+
+  for (const row of results || []) {
+    const qids = getRowQuestionIds(row);
+    for (const qid of qids) {
+      const key = String(qid);
+
+      let status = String(row?.questionStatus?.[key] || row?.questionMeta?.[key]?.status || "").trim();
+      if (!status) {
+        const expected = String(row?.answerKey?.[key] || exam?.answerKey?.[key] || "").toUpperCase();
+        const marked = String(row?.answers?.[key] || "").trim().toUpperCase();
+        status = recalculateQuestionStatus(marked, expected);
+      }
+
+      if (!statsById.has(key)) {
+        statsById.set(key, { applied: 0, correct: 0, wrong: 0, annulled: 0 });
+      }
+      const entry = statsById.get(key);
+      entry.applied += 1;
+      if (status === "correta") {
+        entry.correct += 1;
+      } else if (status === "anulada") {
+        entry.annulled += 1;
+      } else {
+        entry.wrong += 1;
+      }
+    }
+  }
+
+  const stats = Array.from(statsById.entries()).map(([qid, entry]) => {
+    const applied = Number(entry.applied || 0);
+    const annulled = Number(entry.annulled || 0);
+    const scored = Math.max(0, applied - annulled);
+    const correct = Number(entry.correct || 0);
+    const wrong = Number(entry.wrong || 0);
+    const correctPct = scored ? (correct / scored) * 100 : 0;
+    const difficulty = correctPct >= 70 ? "Facil" : (correctPct >= 40 ? "Media" : "Dificil");
+    return {
+      qid,
+      applied,
+      correct,
+      wrong,
+      annulled,
+      correctPct,
+      difficulty,
+    };
+  });
+
+  stats.sort((a, b) => (b.applied - a.applied) || compareQuestionId(a.qid, b.qid));
+  return stats;
+}
+
 function renderQuestionStats(exam, results) {
   const stats = calculateQuestionStats(exam, results);
   if (!stats.length) {
@@ -1079,15 +1188,83 @@ function renderQuestionStats(exam, results) {
     const pct = item.correctPct;
     const pillClass = pct >= 70 ? "ok" : (pct >= 40 ? "neutral" : "bad");
     return `
-      <div class="question-line ${pct >= 70 ? "correct" : (pct >= 40 ? "blank" : "wrong")}">
+      <div class="question-line question-stat ${pct >= 70 ? "correct" : (pct >= 40 ? "blank" : "wrong")}" data-qid="${escapeHtml(item.qid)}">
         <div><strong>${escapeHtml(item.qid)}</strong></div>
-        <div><strong>Correta:</strong> ${escapeHtml(item.correctLetter)}</div>
+        <div><strong>Vezes aplicada:</strong> ${Number(item.applied || 0)}${item.annulled ? ` (Anuladas: ${Number(item.annulled || 0)})` : ""}</div>
         <div><strong>Acerto:</strong> <span class="pill ${pillClass}">${pct.toFixed(1)}%</span></div>
-        <div><strong>Dificuldade:</strong> ${escapeHtml(item.difficulty)}</div>
+        <div><strong>Acertos:</strong> ${Number(item.correct || 0)} | <strong>Erros:</strong> ${Number(item.wrong || 0)} (${escapeHtml(item.difficulty)})</div>
       </div>
     `;
   }).join("");
   state.elements.questionStats.innerHTML = cards;
+}
+
+function handleQuestionStatsClick(event) {
+  const target = event?.target?.closest?.(".question-stat");
+  if (!target) {
+    return;
+  }
+  const qid = target.dataset?.qid;
+  if (!qid) {
+    return;
+  }
+  openQuestionDialog(String(qid));
+}
+
+function openQuestionDialog(qid) {
+  if (!state.elements?.questionDialog || !state.elements?.questionDialogBody) {
+    return;
+  }
+
+  const examGroupId = state.elements.examSelect?.value;
+  const store = loadResultsStore();
+  const exam = store.examGroups?.[examGroupId];
+  const results = Array.isArray(exam?.results) ? exam.results : [];
+  const stat = exam ? calculateQuestionStats(exam, results).find((item) => String(item.qid) === String(qid)) : null;
+
+  const bank = loadQuestionBankStore();
+  const question = bank.questions?.[qid] || null;
+  const metaLines = [];
+  if (question?.disciplina) metaLines.push(`<div><strong>Disciplina:</strong> ${escapeHtml(question.disciplina)}</div>`);
+  if (question?.conteudo) metaLines.push(`<div><strong>Conteúdo:</strong> ${escapeHtml(question.conteudo)}</div>`);
+  if (question?.subconteudo) metaLines.push(`<div><strong>Subconteúdo:</strong> ${escapeHtml(question.subconteudo)}</div>`);
+  if (question?.dificuldade) metaLines.push(`<div><strong>Dificuldade:</strong> ${escapeHtml(question.dificuldade)}</div>`);
+
+  const correct = question?.correta ? String(question.correta).toUpperCase() : "";
+  const alternatives = Array.isArray(question?.alternativas) ? question.alternativas : [];
+  const alternativesHtml = alternatives.length
+    ? `<div style="margin-top: 12px; display: grid; gap: 6px;">
+        ${alternatives.map((alt) => {
+          const letter = String(alt.letter || alt.letra || alt.label || "").toUpperCase();
+          const text = String(alt.text ?? alt.texto ?? alt.valor ?? alt.value ?? "");
+          const isCorrect = correct && letter && letter === correct;
+          return `<div class="answer-item ${isCorrect ? "correct" : ""}"><strong>${escapeHtml(letter)})</strong> <span style="white-space: pre-wrap;">${escapeHtml(text)}</span></div>`;
+        }).join("")}
+      </div>`
+    : `<div class="hint" style="margin-top: 12px;">Alternativas não encontradas no banco importado.</div>`;
+
+  const statsLine = stat
+    ? `<div style="margin-top: 10px;">
+        <div><strong>Vezes aplicada:</strong> ${Number(stat.applied || 0)}${stat.annulled ? ` (Anuladas: ${Number(stat.annulled || 0)})` : ""}</div>
+        <div><strong>Acertos:</strong> ${Number(stat.correct || 0)} | <strong>Erros:</strong> ${Number(stat.wrong || 0)}</div>
+        <div><strong>Taxa de acerto:</strong> ${Number(stat.correctPct || 0).toFixed(1)}%</div>
+      </div>`
+    : "";
+
+  state.elements.questionDialogBody.innerHTML = `
+    <div class="dialog-body">
+      <h3 style="margin-top: 0;">Questão ${escapeHtml(qid)}</h3>
+      ${statsLine}
+      ${metaLines.join("")}
+      ${question?.enunciado
+        ? `<div style="margin-top: 12px; white-space: pre-wrap;">${escapeHtml(question.enunciado)}</div>`
+        : `<div class="hint" style="margin-top: 12px;">Questão não encontrada no banco importado. Importe o banco de questões para ver enunciado e alternativas.</div>`}
+      ${question ? alternativesHtml : ""}
+      ${question && correct ? `<div class="hint" style="margin-top: 12px;"><strong>Gabarito (banco):</strong> ${escapeHtml(correct)}</div>` : ""}
+    </div>
+  `;
+
+  state.elements.questionDialog.showModal();
 }
 
 function downloadBlob(filename, content, mime) {
@@ -1137,15 +1314,14 @@ function exportQuestionsCsv(examGroupId) {
     return;
   }
   const stats = calculateQuestionStats(exam, exam.results || []);
-  const header = ["Questão", "Correta", "% Acerto", "Acertos", "Erros", "Em branco", "Mais marcada", "Dificuldade"];
+  const header = ["Questao (ID)", "Vezes aplicada", "Acertos", "Erros", "% Acerto", "Anuladas", "Dificuldade"];
   const rows = stats.map((s) => [
     s.qid,
-    s.correctLetter,
-    s.correctPct.toFixed(2),
+    s.applied,
     s.correct,
     s.wrong,
-    s.blank,
-    s.mostMarked,
+    s.correctPct.toFixed(2),
+    s.annulled,
     s.difficulty,
   ]);
   const csv = [header, ...rows].map((line) => line.map(csvEscape).join(",")).join("\n");
@@ -1310,6 +1486,160 @@ async function importResultsFromJsonFile() {
   saveResultsStore(store);
   alert(`Importação concluída. Avaliações adicionadas: ${addedGroups}. Resultados adicionados: ${addedResults}.`);
   window.location.reload();
+}
+
+function normalizeQuestionBankAlternative(item, index) {
+  const letters = ["A", "B", "C", "D", "E"];
+  if (item && typeof item === "object") {
+    const letter = String(item.letra || item.letter || item.label || "").trim().toUpperCase() || letters[index] || "";
+    const text = String(item.text ?? item.texto ?? item.valor ?? item.value ?? "");
+    return { letter, text };
+  }
+  const letter = letters[index] || "";
+  return { letter, text: String(item ?? "") };
+}
+
+function normalizeQuestionBankEntry(raw) {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const qid = String(raw.id_questao || raw.id || raw.qid || raw.questionId || raw.codigo || raw.code || "").trim();
+  if (!qid) {
+    return null;
+  }
+  const enunciado = String(raw.enunciado || raw.statement || raw.question || raw.text || raw.pergunta || "").trim();
+  const disciplina = String(raw.disciplina || raw.materia || raw.subject || "").trim();
+  const conteudo = String(raw.conteudo || raw.content || "").trim();
+  const subconteudo = String(raw.subconteudo || raw.subcontent || "").trim();
+  const dificuldade = String(raw.dificuldade || raw.level || raw.difficulty || "").trim();
+  const correta = String(raw.correta || raw.gabarito || raw.answer || raw.correct || raw.correta_letra || "").trim().toUpperCase();
+
+  const source = raw.alternativas ?? raw.alternatives ?? raw.options ?? raw.opcoes ?? raw.alts;
+  let alternativas = [];
+  if (Array.isArray(source)) {
+    alternativas = source.map((item, index) => normalizeQuestionBankAlternative(item, index));
+  } else if (source && typeof source === "object") {
+    alternativas = Object.entries(source).map(([key, value], index) => {
+      const letter = String(key || "").trim().toUpperCase() || ["A", "B", "C", "D", "E"][index] || "";
+      const text = typeof value === "string" ? value : String(value?.text ?? value?.texto ?? value?.valor ?? value?.value ?? "");
+      return { letter, text };
+    });
+  }
+
+  const order = { A: 0, B: 1, C: 2, D: 3, E: 4 };
+  alternativas = alternativas
+    .map((alt, index) => ({
+      letter: String(alt.letter || "").trim().toUpperCase() || ["A", "B", "C", "D", "E"][index] || "",
+      text: String(alt.text ?? "").trim(),
+    }))
+    .filter((alt) => Boolean(alt.letter) || Boolean(alt.text))
+    .sort((a, b) => (order[a.letter] ?? 99) - (order[b.letter] ?? 99));
+
+  return {
+    qid,
+    disciplina,
+    conteudo,
+    subconteudo,
+    dificuldade,
+    enunciado,
+    alternativas,
+    correta,
+  };
+}
+
+function extractQuestionBankList(parsed) {
+  if (!parsed) return [];
+  if (Array.isArray(parsed)) return parsed;
+
+  const container = parsed.data && typeof parsed.data === "object" ? parsed.data : parsed;
+  if (Array.isArray(container.questions)) return container.questions;
+  if (Array.isArray(container.questoes)) return container.questoes;
+  if (container.questions && typeof container.questions === "object" && !Array.isArray(container.questions)) {
+    return Object.entries(container.questions).map(([key, value]) => ({
+      ...(value && typeof value === "object" ? value : {}),
+      id_questao: value?.id_questao || value?.id || key,
+    }));
+  }
+  if (container.questoes && typeof container.questoes === "object" && !Array.isArray(container.questoes)) {
+    return Object.entries(container.questoes).map(([key, value]) => ({
+      ...(value && typeof value === "object" ? value : {}),
+      id_questao: value?.id_questao || value?.id || key,
+    }));
+  }
+  return [];
+}
+
+async function importQuestionBankFromJsonFile() {
+  const file = state.elements.importQuestionsFile?.files?.[0];
+  if (!file) {
+    alert("Selecione um arquivo JSON do banco de questões para importar.");
+    return;
+  }
+
+  let text = "";
+  try {
+    text = await file.text();
+  } catch {
+    alert("Não foi possível ler o arquivo.");
+    return;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    alert("JSON inválido.");
+    return;
+  }
+
+  const list = extractQuestionBankList(parsed);
+  const incoming = {};
+  for (const item of list) {
+    const normalized = normalizeQuestionBankEntry(item);
+    if (normalized) {
+      incoming[normalized.qid] = normalized;
+    }
+  }
+
+  const incomingCount = Object.keys(incoming).length;
+  if (!incomingCount) {
+    alert("Nenhuma questão foi encontrada no arquivo importado.");
+    return;
+  }
+
+  const store = loadQuestionBankStore();
+  store.questions ||= {};
+  let added = 0;
+  let updated = 0;
+  for (const [qid, entry] of Object.entries(incoming)) {
+    if (store.questions[qid]) {
+      updated += 1;
+    } else {
+      added += 1;
+    }
+    store.questions[qid] = entry;
+  }
+
+  try {
+    saveQuestionBankStore(store);
+  } catch (error) {
+    alert(`Não foi possível salvar o banco importado (armazenamento cheio?).\n\n${error?.message || String(error)}`);
+    return;
+  }
+
+  if (state.elements.importQuestionsFile) {
+    state.elements.importQuestionsFile.value = "";
+  }
+  alert(`Banco importado: ${incomingCount} questão(ões). Novas: ${added}. Atualizadas: ${updated}.`);
+}
+
+function clearImportedQuestionBank() {
+  const confirmed = window.confirm("Remover o banco de questões importado deste navegador?");
+  if (!confirmed) {
+    return;
+  }
+  clearQuestionBankStore();
+  alert("Banco de questões removido.");
 }
 
 async function startQrCamera() {
@@ -4286,6 +4616,30 @@ function saveResultsStore(store) {
   localStorage.setItem(RESULTS_STORAGE_KEY, JSON.stringify(store));
 }
 
+function loadQuestionBankStore() {
+  try {
+    const raw = localStorage.getItem(QUESTION_BANK_STORAGE_KEY);
+    if (!raw) {
+      return { version: 1, questions: {} };
+    }
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && parsed.questions && typeof parsed.questions === "object" && !Array.isArray(parsed.questions)) {
+      return { version: Number(parsed.version) || 1, questions: parsed.questions };
+    }
+    return { version: 1, questions: {} };
+  } catch {
+    return { version: 1, questions: {} };
+  }
+}
+
+function saveQuestionBankStore(store) {
+  localStorage.setItem(QUESTION_BANK_STORAGE_KEY, JSON.stringify(store));
+}
+
+function clearQuestionBankStore() {
+  localStorage.removeItem(QUESTION_BANK_STORAGE_KEY);
+}
+
 function migrateResultsStore(parsed) {
   const empty = { version: 2, exams: {} };
   if (!parsed || typeof parsed !== "object") {
@@ -4483,10 +4837,13 @@ function saveStudentResult({ proof, result }) {
 
   const answerKey = {};
   const questionIds = [];
+  const numberToQuestionId = new Map();
   for (const question of proof.questoes || []) {
-    const qid = questionIdForNumber(question.numero);
+    const rawId = String(question.id_questao || question.qid || question.id || "").trim();
+    const qid = rawId || questionIdForNumber(question.numero);
     questionIds.push(qid);
     answerKey[qid] = String(question.correta_letra || "").toUpperCase();
+    numberToQuestionId.set(Number(question.numero), qid);
   }
 
   const answers = {};
@@ -4494,7 +4851,7 @@ function saveStudentResult({ proof, result }) {
   const questionMeta = {};
 
   for (const detail of result.detalhes || []) {
-    const qid = questionIdForNumber(detail.numero);
+    const qid = numberToQuestionId.get(Number(detail.numero)) || questionIdForNumber(detail.numero);
     const status = String(detail.status || "em_branco");
     const expected = String(detail.correta || "").toUpperCase();
     const marked = String(detail.marcada || "").toUpperCase();
@@ -4521,15 +4878,31 @@ function saveStudentResult({ proof, result }) {
     examGroupId,
     examName,
     createdAtFromId: parsedDate.iso || "",
-    answerKey,
-    questionIds,
+    answerKey: {},
+    questionIds: [],
     results: [],
     annulled: {},
   };
 
   // Atualiza gabarito se já existir (mantém o mais recente).
-  store.examGroups[examGroupId].answerKey = answerKey;
-  store.examGroups[examGroupId].questionIds = questionIds;
+  // Mantem um conjunto (uniao) de questoes aplicadas no grupo.
+  if (!Array.isArray(store.examGroups[examGroupId].questionIds)) {
+    store.examGroups[examGroupId].questionIds = [];
+  }
+  const mergedIds = store.examGroups[examGroupId].questionIds.map((value) => String(value));
+  for (const qid of questionIds) {
+    const key = String(qid);
+    if (!mergedIds.includes(key)) {
+      mergedIds.push(key);
+    }
+  }
+  store.examGroups[examGroupId].questionIds = mergedIds;
+
+  // Preserva um gabarito base apenas se ainda nao existir (compatibilidade/export).
+  const existingKey = store.examGroups[examGroupId].answerKey;
+  if (!existingKey || typeof existingKey !== "object" || !Object.keys(existingKey).length) {
+    store.examGroups[examGroupId].answerKey = answerKey;
+  }
   store.examGroups[examGroupId].examName = store.examGroups[examGroupId].examName || examName;
   store.examGroups[examGroupId].createdAtFromId = store.examGroups[examGroupId].createdAtFromId || parsedDate.iso || "";
   if (!Array.isArray(store.examGroups[examGroupId].results)) {
@@ -4563,6 +4936,7 @@ function saveStudentResult({ proof, result }) {
     percentage,
     answers,
     answerKey,
+    questionIds,
     questionStatus,
     questionMeta,
   };
@@ -4669,9 +5043,28 @@ function parseQrPayload(rawValue) {
   const jsonText = decodeBase64Url(encoded);
   const payload = JSON.parse(jsonText);
   const answerKey = String(payload.g || "").toUpperCase();
-  const questions = Array.from(answerKey).map((letter, index) => ({
+
+  const rawQuestionIds = payload.q || payload.qids || payload.questionIds || payload.questions;
+  let questionIds = [];
+  if (Array.isArray(rawQuestionIds)) {
+    questionIds = rawQuestionIds.map((value) => String(value ?? "").trim()).filter(Boolean);
+  } else if (typeof rawQuestionIds === "string") {
+    questionIds = rawQuestionIds
+      .split(/[,\s|]+/)
+      .map((value) => String(value ?? "").trim())
+      .filter(Boolean);
+  }
+
+  const letters = Array.from(answerKey);
+  const idsOk = questionIds.length === letters.length;
+  if (!idsOk) {
+    questionIds = [];
+  }
+
+  const questions = letters.map((letter, index) => ({
     numero: index + 1,
     correta_letra: letter,
+    id_questao: idsOk ? questionIds[index] : "",
   }));
 
   return {
@@ -4680,6 +5073,7 @@ function parseQrPayload(rawValue) {
     studentId: payload.sid || payload.studentId || payload.matricula || payload.m || "",
     quantidade_questoes: questions.length,
     questoes: questions,
+    question_ids: idsOk ? questionIds : [],
   };
 }
 
