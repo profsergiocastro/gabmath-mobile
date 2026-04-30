@@ -1808,9 +1808,10 @@ function enterCardMode(proof, { autoStart } = { autoStart: false }) {
   state.lastDetection = null;
   state.autoStartCardReading = Boolean(autoStart);
 
-  // Ao sair do QR, sempre libera a câmera e espera o usuário iniciar.
-  stopQrCamera();
-  setCameraPanelVisible(false);
+  // Ao sair do QR, para apenas o loop do QR (não fecha a câmera).
+  stopLoops();
+  state.qrProcessing = false;
+  clearOverlay();
 
   if (state.elements.qrStep) {
     state.elements.qrStep.classList.add("hidden");
@@ -1834,15 +1835,39 @@ function enterCardMode(proof, { autoStart } = { autoStart: false }) {
     return;
   }
 
-  setStatus('Alinhe o celular com o cartão-resposta e toque em "Tirar foto do cartão".');
+  if (state.autoStartCardReading) {
+    setStatus("Câmera pronta. Alinhe o cartão no retângulo verde.");
+    void enableAnswerCamera();
+    return;
+  }
+
+  setStatus('Alinhe o celular com o cartão-resposta e toque em "Iniciar leitura".');
 }
 
-function backToQrMode() {
+function backToQrMode(options = {}) {
+  const keepCamera = options.keepCamera !== false;
+  const autoScan = options.autoScan !== false;
+  const statusText = String(options.statusText || "Aponte a câmera apenas para o QR Code.");
   state.cardMode = false;
   state.autoStartCardReading = false;
   stopLoops();
-  stopAnswerCamera();
-  setCameraPanelVisible(false);
+  clearOverlay();
+  if (!keepCamera) {
+    stopAnswerCamera();
+    setCameraPanelVisible(false);
+  } else {
+    // Mantém a câmera aberta para acelerar o fluxo (sem reabrir).
+    if (state.stream && state.elements.video?.srcObject) {
+      try {
+        state.elements.video?.play?.();
+      } catch {
+        // ignore
+      }
+      setCameraPanelVisible(true);
+    } else {
+      setCameraPanelVisible(false);
+    }
+  }
   state.proof = null;
   state.answers = {};
   state.stableSignature = "";
@@ -1857,8 +1882,12 @@ function backToQrMode() {
     state.elements.qrStep.classList.remove("hidden");
   }
   setBadge("Lendo QR");
-  setWorkflowState("idle", "Aponte a câmera apenas para o QR Code.");
+  const canScan = autoScan && state.stream && state.elements.video?.srcObject;
+  setWorkflowState(canScan ? "qrScanning" : "idle", statusText);
   updateCardControls();
+  if (canScan) {
+    startQrLoop();
+  }
 }
 
 async function detectQrCode(videoElement) {
@@ -2024,7 +2053,7 @@ function commitQrAndGo(rawValue) {
     const proof = parseQrPayload(normalized);
     sessionStorage.setItem(STORAGE_KEY, JSON.stringify(proof));
     if (state.elements.cardStep) {
-      enterCardMode(proof, { autoStart: false });
+      enterCardMode(proof, { autoStart: true });
     } else {
       window.location.href = "./card.html";
     }
@@ -2058,6 +2087,10 @@ function waitForOpenCv() {
 
 function onOpenCvReady() {
   updateCardControls();
+  if (state.cardMode && state.autoStartCardReading && state.workflow !== "answerScanning") {
+    // Ao entrar no cartão via QR, tenta iniciar automaticamente assim que o OpenCV estiver pronto.
+    void enableAnswerCamera();
+  }
 }
 
 function renderProofSummary() {
@@ -2466,7 +2499,15 @@ function startCardReading() {
         return;
       }
 
-      stopAnswerCamera();
+      // Para a leitura, mas mantém a câmera aberta para agilizar a próxima correção.
+      stopLoops();
+      clearOverlay();
+      setCameraPanelVisible(false);
+      try {
+        state.elements.video?.pause?.();
+      } catch {
+        // ignore
+      }
       correctProof();
       setWorkflowState("answerDetected");
       updateCardControls();
@@ -2538,12 +2579,26 @@ async function enableAnswerCamera() {
     return;
   }
 
+  // Se a câmera já está aberta (ex.: acabou de ler o QR), reaproveita sem reabrir.
+  state.autoStartCardReading = false;
+  if (state.stream && state.elements.video?.srcObject) {
+    try {
+      await state.elements.video.play?.();
+    } catch {
+      // ignore
+    }
+    setCameraPanelVisible(true);
+    startCardReading();
+    return;
+  }
+
   await startCardCamera();
   if (!state.stream) {
     setWorkflowState("error", "Falha ao abrir a câmera.");
     updateCardControls();
     return;
   }
+  state.autoStartCardReading = false;
   startCardReading();
 }
 
@@ -4590,6 +4645,14 @@ function confirmReading() {
 
   setStatus("Resultado salvo com sucesso.");
   showConfirmMessage("Resultado salvo com sucesso.");
+  // Acelera o fluxo: volta automaticamente para ler o próximo QR.
+  setTimeout(() => {
+    backToQrMode({
+      keepCamera: true,
+      autoScan: true,
+      statusText: "Resultado salvo. Aponte a câmera para o próximo QR Code.",
+    });
+  }, 250);
 }
 
 function cancelReading() {
