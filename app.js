@@ -12,9 +12,15 @@ const CARD_TARGET = {
 const CARD_PROCESSING_MAX_WIDTH = 960;
 const PHOTO_PROCESSING_MAX_WIDTH = 2200;
 const PHOTO_PROCESSING_FALLBACK_MAX_WIDTH = 3600;
-const CARD_FRAME_INTERVAL_MS = 140;
+// Modo tempo real: processamento amostrado (não processa todo frame).
+// Aumentar um pouco o intervalo reduz travamentos em celulares mais fracos.
+const CARD_FRAME_INTERVAL_MS = 200;
 const MIN_FOCUS_SCORE = 120;
-const REQUIRED_STABLE_FRAMES = 4;
+// Quantos frames consecutivos precisam estar estáveis antes de capturar.
+const REQUIRED_STABLE_FRAMES = 3;
+// Resolução máxima do frame usado para detectar marcadores em tempo real.
+// Menor = mais rápido; a leitura final usa um frame maior.
+const REALTIME_DETECTION_MAX_WIDTH = 560;
 // Score mínimo para aceitar o quadrilátero dos 4 marcadores.
 // Valor mais baixo permite foto com o cartão mais distante (menor na imagem),
 // mas ainda rejeita casos onde a geometria fica inconsistente.
@@ -58,6 +64,7 @@ const state = {
   cardMode: false,
   autoStartCardReading: false,
   debug: false,
+  cardCaptureMode: "realtime", // "realtime" | "diagnosticPhoto"
   lastPhotoMeta: null,
   workflow: "idle",
   qrProcessing: false,
@@ -71,6 +78,8 @@ const state = {
 
 const captureCanvas = document.createElement("canvas");
 const processingCanvas = document.createElement("canvas");
+const captureCanvasContext = captureCanvas.getContext("2d", { willReadFrequently: true });
+const processingCanvasContext = processingCanvas.getContext("2d", { willReadFrequently: true });
 
 document.addEventListener("DOMContentLoaded", initializeApp);
 
@@ -167,6 +176,7 @@ function initializeQrPage() {
     disableCameraButton: document.getElementById("disable-camera"),
     cardPhotoInput: document.getElementById("card-photo-input"),
     proofSummary: document.getElementById("proof-summary"),
+    cardHint: document.getElementById("card-hint"),
     answerGrid: document.getElementById("answer-grid"),
     resultPanel: document.getElementById("result-panel"),
     alignedCanvas: document.getElementById("aligned-preview"),
@@ -189,14 +199,12 @@ function initializeQrPage() {
 
   waitForOpenCv();
   setStatus("Aponte a camera apenas para o QR Code.");
-  state.debug = Boolean(getQueryFlag("debug")) || Boolean(state.elements.debugToggle?.checked);
-  updateDebugUi();
   if (state.elements.debugToggle) {
     state.elements.debugToggle.addEventListener("change", () => {
-      state.debug = Boolean(state.elements.debugToggle.checked);
-      updateDebugUi();
+      handleCardCaptureModeToggle();
     });
   }
+  handleCardCaptureModeToggle();
   if (state.elements.cardPhotoInput && !state.elements.cardPhotoInput.dataset.wired) {
     state.elements.cardPhotoInput.dataset.wired = "1";
     state.elements.cardPhotoInput.addEventListener("change", async (event) => {
@@ -238,6 +246,7 @@ function initializeCardPage() {
     disableCameraButton: document.getElementById("disable-camera"),
     cardPhotoInput: document.getElementById("card-photo-input"),
     proofSummary: document.getElementById("proof-summary"),
+    cardHint: document.getElementById("card-hint"),
     scanStatus: document.getElementById("scan-status"),
     answerGrid: document.getElementById("answer-grid"),
     resultPanel: document.getElementById("result-panel"),
@@ -248,14 +257,12 @@ function initializeCardPage() {
   wireCardButtons();
 
   waitForOpenCv();
-  state.debug = Boolean(getQueryFlag("debug")) || Boolean(state.elements.debugToggle?.checked);
-  updateDebugUi();
   if (state.elements.debugToggle) {
     state.elements.debugToggle.addEventListener("change", () => {
-      state.debug = Boolean(state.elements.debugToggle.checked);
-      updateDebugUi();
+      handleCardCaptureModeToggle();
     });
   }
+  handleCardCaptureModeToggle();
   if (state.elements.cardPhotoInput && !state.elements.cardPhotoInput.dataset.wired) {
     state.elements.cardPhotoInput.dataset.wired = "1";
     state.elements.cardPhotoInput.addEventListener("change", async (event) => {
@@ -1550,7 +1557,7 @@ async function detectQrCode(videoElement) {
     const scale = Math.min(1, maxSide / Math.max(cropWidth, cropHeight, 1));
     captureCanvas.width = Math.max(1, Math.round(cropWidth * scale));
     captureCanvas.height = Math.max(1, Math.round(cropHeight * scale));
-    const context = captureCanvas.getContext("2d", { willReadFrequently: true });
+    const context = captureCanvasContext || captureCanvas.getContext("2d", { willReadFrequently: true });
     context.drawImage(
       videoElement,
       cropX,
@@ -1766,23 +1773,400 @@ function updateRenderedAnswers() {
   }
 }
 
+function computeAnswerGuideBox(width, height) {
+  const targetAspect = CARD_TARGET.width / CARD_TARGET.height;
+  let boxW = Math.round(width * 0.92);
+  let boxH = Math.round(boxW / Math.max(targetAspect, 0.01));
+  if (boxH > Math.round(height * 0.78)) {
+    boxH = Math.round(height * 0.78);
+    boxW = Math.round(boxH * targetAspect);
+  }
+  const x = Math.round((width - boxW) / 2);
+  const y = Math.round((height - boxH) / 2);
+  return { x, y, w: boxW, h: boxH };
+}
+
+function pickMarkersNearGuideCorners(markers, width, height) {
+  if (!Array.isArray(markers) || markers.length < 4) {
+    return { ok: false, corners: [], rectScore: 0 };
+  }
+
+  const guide = computeAnswerGuideBox(width, height);
+  const expected = [
+    { x: guide.x, y: guide.y }, // tl
+    { x: guide.x + guide.w, y: guide.y }, // tr
+    { x: guide.x + guide.w, y: guide.y + guide.h }, // br
+    { x: guide.x, y: guide.y + guide.h }, // bl
+  ];
+
+  const maxDist = Math.min(guide.w, guide.h) * 0.55;
+  const chosen = [null, null, null, null];
+
+  for (const marker of markers) {
+    const center = marker.center;
+    if (!center || !Number.isFinite(center.x) || !Number.isFinite(center.y)) {
+      continue;
+    }
+    let bestIndex = -1;
+    let bestDistance = Infinity;
+    for (let i = 0; i < expected.length; i += 1) {
+      const d = distance(center, expected[i]);
+      if (d < bestDistance) {
+        bestDistance = d;
+        bestIndex = i;
+      }
+    }
+    if (bestIndex < 0 || bestDistance > maxDist) {
+      continue;
+    }
+    const current = chosen[bestIndex];
+    if (!current) {
+      chosen[bestIndex] = marker;
+      continue;
+    }
+    const currentScore = Number(current.squareScore || 0) + Math.sqrt(Number(current.area || 0)) * 0.00025;
+    const markerScore = Number(marker.squareScore || 0) + Math.sqrt(Number(marker.area || 0)) * 0.00025;
+    if (markerScore > currentScore) {
+      chosen[bestIndex] = marker;
+    }
+  }
+
+  if (chosen.some((item) => !item)) {
+    return { ok: false, corners: [], rectScore: 0 };
+  }
+
+  const ordered = orderCorners(chosen.map((m) => m.center));
+  const validation = validateCornerGeometry(ordered, width, height);
+  if (!validation.ok) {
+    return { ok: false, corners: [], rectScore: validation.rectScore || 0 };
+  }
+
+  return { ok: true, corners: ordered, rectScore: validation.rectScore || 0 };
+}
+
+function cornersMeanDistance(cornersA, cornersB) {
+  if (!Array.isArray(cornersA) || !Array.isArray(cornersB) || cornersA.length !== 4 || cornersB.length !== 4) {
+    return Infinity;
+  }
+  let sum = 0;
+  for (let i = 0; i < 4; i += 1) {
+    sum += distance(cornersA[i], cornersB[i]);
+  }
+  return sum / 4;
+}
+
+function detectCardCornersRealtime(videoElement) {
+  if (videoElement.videoWidth < 160 || videoElement.videoHeight < 160) {
+    return null;
+  }
+
+  const scale = Math.min(1, REALTIME_DETECTION_MAX_WIDTH / Math.max(videoElement.videoWidth, 1));
+  processingCanvas.width = Math.max(1, Math.round(videoElement.videoWidth * scale));
+  processingCanvas.height = Math.max(1, Math.round(videoElement.videoHeight * scale));
+  const captureContext = processingCanvasContext || processingCanvas.getContext("2d", { willReadFrequently: true });
+  captureContext.drawImage(videoElement, 0, 0, processingCanvas.width, processingCanvas.height);
+
+  const src = cv.imread(processingCanvas);
+  const gray = new cv.Mat();
+  const blur = new cv.Mat();
+  const thresh = new cv.Mat();
+
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    // Kernel menor para manter desempenho no mobile (suficiente para reduzir ruído leve).
+    cv.GaussianBlur(gray, blur, new cv.Size(3, 3), 0, 0, cv.BORDER_DEFAULT);
+    cv.threshold(blur, thresh, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+    if (state.opencvKernel) {
+      cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
+    }
+
+    let markers = findMarkersRealtime(thresh, processingCanvas.width, processingCanvas.height);
+    if (markers.length < 4) {
+      cv.adaptiveThreshold(
+        blur,
+        thresh,
+        255,
+        cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv.THRESH_BINARY_INV,
+        31,
+        7,
+      );
+      if (state.opencvKernel) {
+        cv.morphologyEx(thresh, thresh, cv.MORPH_CLOSE, state.opencvKernel);
+      }
+      markers = findMarkersRealtime(thresh, processingCanvas.width, processingCanvas.height);
+    }
+
+    if (markers.length < 4) {
+      return null;
+    }
+
+    const selection = pickMarkersNearGuideCorners(markers, processingCanvas.width, processingCanvas.height);
+    if (!selection.ok || selection.rectScore < MIN_CARD_RECTANGLE_SCORE) {
+      return null;
+    }
+
+    return { corners: selection.corners, rectScore: selection.rectScore };
+  } finally {
+    src.delete();
+    gray.delete();
+    blur.delete();
+    thresh.delete();
+  }
+}
+
+function scaleCorners(corners, factor) {
+  if (!Array.isArray(corners) || corners.length !== 4 || !Number.isFinite(factor) || factor <= 0) {
+    return [];
+  }
+  return corners.map((point) => ({
+    x: Number(point?.x || 0) * factor,
+    y: Number(point?.y || 0) * factor,
+  }));
+}
+
+function detectCardAnswersFromCanvasWithCorners(canvasElement, questionCount, corners) {
+  if (!canvasElement?.width || !canvasElement?.height) {
+    return null;
+  }
+  if (!Array.isArray(corners) || corners.length !== 4) {
+    return null;
+  }
+
+  const src = cv.imread(canvasElement);
+  const gray = new cv.Mat();
+
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.equalizeHist(gray, gray);
+
+    const ordered = orderCorners(corners);
+    const validation = validateCornerGeometry(ordered, canvasElement.width, canvasElement.height);
+    if (!validation.ok) {
+      return null;
+    }
+
+    const warped = perspectiveWarp(gray, ordered);
+    const warpValidation = validateWarpedCardMarkers(warped);
+    if (!warpValidation.ok) {
+      warped.delete();
+      return null;
+    }
+
+    const focusScore = measureFocus(warped);
+    const basePreview = new cv.Mat();
+    cv.cvtColor(warped, basePreview, cv.COLOR_GRAY2RGBA);
+
+    let reading;
+    try {
+      reading = readAnswersFromWarpedV2(warped, questionCount);
+    } catch {
+      reading = readAnswersFromWarped(warped, questionCount);
+    }
+
+    const baseImageData = matToImageData(basePreview);
+    warped.delete();
+    basePreview.delete();
+
+    if (state.debug) {
+      drawGridOverlay(baseImageData, reading.rows);
+    }
+
+    return {
+      corners: ordered,
+      answers: reading.answers,
+      rows: reading.rows,
+      baseImageData,
+      focusScore,
+      diagnostics: {
+        rectScore: validation.rectScore ?? null,
+        warpValidation: {
+          ok: warpValidation.ok,
+          avg: warpValidation.avg,
+          min: warpValidation.min,
+          scores: warpValidation.scores,
+        },
+      },
+    };
+  } finally {
+    src.delete();
+    gray.delete();
+  }
+}
+
 function startCardReading() {
-  // Fluxo antigo (tempo real) foi substituído por captura de foto.
-  setStatus('Use o botão "Tirar foto do cartão" para fazer a leitura.');
+  if (!state.proof) {
+    setStatus("Nenhuma prova carregada.");
+    return;
+  }
+  if (!state.stream || !state.elements.video?.srcObject) {
+    setStatus("Abra a câmera antes de iniciar a leitura do cartão.");
+    return;
+  }
+  if (!state.opencvReady) {
+    setStatus("OpenCV ainda está carregando.");
+    return;
+  }
+
+  if (state.cardCaptureMode === "diagnosticPhoto") {
+    setStatus('Use o botão "Tirar foto do cartão (diagnóstico)" para fazer a leitura.');
+    return;
+  }
+
+  setWorkflowState("answerScanning");
+  updateCardControls();
+  state.answers = {};
+  state.stableSignature = "";
+  state.stableCount = 0;
+  state.lastDetection = null;
+  state.lastResult = null;
+  if (state.elements.resultPanel) {
+    state.elements.resultPanel.classList.add("hidden");
+    state.elements.resultPanel.innerHTML = "";
+  }
+  clearOverlay();
+  stopLoops();
+
+  setStatus("Alinhe os 4 quadradinhos pretos nos cantos do retângulo verde. Aguarde a captura automática.");
+
+  let lastTimestamp = 0;
+  const startAt = performance.now();
+  let warned = false;
+  let referenceCorners = null;
+  let referenceRect = 0;
+
+  const tick = (timestamp) => {
+    if (state.workflow !== "answerScanning") {
+      return;
+    }
+    if (!state.elements.video?.srcObject) {
+      state.cardTimer = requestAnimationFrame(tick);
+      return;
+    }
+    if (timestamp - lastTimestamp < CARD_FRAME_INTERVAL_MS) {
+      state.cardTimer = requestAnimationFrame(tick);
+      return;
+    }
+    lastTimestamp = timestamp;
+
+    drawAnswerGuide();
+
+    const found = detectCardCornersRealtime(state.elements.video);
+    if (!found) {
+      referenceCorners = null;
+      referenceRect = 0;
+      state.stableCount = 0;
+      if (!warned && (timestamp - startAt) > 12000) {
+        warned = true;
+        setStatus("Não foi possível estabilizar a leitura. Tente o modo diagnóstico (por foto).");
+      } else {
+        setStatus("Procurando os 4 marcadores... mantenha o cartão inteiro visível e bem iluminado.");
+      }
+      state.cardTimer = requestAnimationFrame(tick);
+      return;
+    }
+
+    drawOverlay(found.corners);
+
+    const minDim = Math.min(processingCanvas.width, processingCanvas.height);
+    const tolerance = Math.max(8, minDim * 0.018);
+
+    if (referenceCorners) {
+      const dist = cornersMeanDistance(referenceCorners, found.corners);
+      const rectDelta = Math.abs((found.rectScore || 0) - (referenceRect || 0));
+      if (dist <= tolerance && rectDelta <= 0.03) {
+        state.stableCount += 1;
+      } else {
+        state.stableCount = 1;
+        referenceCorners = found.corners;
+        referenceRect = found.rectScore || 0;
+      }
+    } else {
+      state.stableCount = 1;
+      referenceCorners = found.corners;
+      referenceRect = found.rectScore || 0;
+    }
+
+    setStatus(`Cartão detectado. Estabilizando... ${state.stableCount}/${REQUIRED_STABLE_FRAMES}`);
+
+    if (state.stableCount >= REQUIRED_STABLE_FRAMES) {
+      // Captura o melhor frame (mais recente) e roda o pipeline completo UMA vez.
+      // Otimiza: reaproveita os cantos detectados no modo tempo real, evitando re-detectar marcadores no frame final.
+      const questionCount = state.proof.quantidade_questoes;
+      const videoWidth = state.elements.video.videoWidth || 0;
+      const videoHeight = state.elements.video.videoHeight || 0;
+      const finalScale = Math.min(1, CARD_PROCESSING_MAX_WIDTH / Math.max(videoWidth, 1));
+      captureCanvas.width = Math.max(1, Math.round(videoWidth * finalScale));
+      captureCanvas.height = Math.max(1, Math.round(videoHeight * finalScale));
+      const finalContext = captureCanvasContext || captureCanvas.getContext("2d", { willReadFrequently: true });
+      finalContext.drawImage(state.elements.video, 0, 0, captureCanvas.width, captureCanvas.height);
+
+      const cornerFactor = captureCanvas.width / Math.max(1, processingCanvas.width);
+      const scaledCorners = scaleCorners(found.corners, cornerFactor);
+
+      let detection = detectCardAnswersFromCanvasWithCorners(captureCanvas, questionCount, scaledCorners);
+      if (!detection) {
+        // Fallback: tenta a rotina antiga (redetecta marcadores) se o reaproveitamento falhar.
+        detection = detectCardAnswers(state.elements.video, questionCount);
+      }
+
+      if (!detection) {
+        state.stableCount = 0;
+        referenceCorners = null;
+        referenceRect = 0;
+        setStatus("Falha ao ler o cartão. Ajuste o enquadramento e tente novamente.");
+        state.cardTimer = requestAnimationFrame(tick);
+        return;
+      }
+
+      state.lastDetection = detection;
+      state.answers = { ...detection.answers };
+      updateRenderedAnswers();
+      drawAlignedPreview(detection.baseImageData);
+
+      if (detection.focusScore < MIN_FOCUS_SCORE) {
+        state.stableCount = 0;
+        referenceCorners = null;
+        referenceRect = 0;
+        setStatus("Imagem ainda sem nitidez suficiente. Afaste um pouco o celular e estabilize.");
+        state.cardTimer = requestAnimationFrame(tick);
+        return;
+      }
+
+      stopAnswerCamera();
+      correctProof();
+      setWorkflowState("answerDetected");
+      updateCardControls();
+      return;
+    }
+
+    state.cardTimer = requestAnimationFrame(tick);
+  };
+
+  state.cardTimer = requestAnimationFrame(tick);
 }
 
 function stopAnswerReading() {
-  // No modo por foto, não há leitura contínua. Mantém por compatibilidade.
   stopLoops();
   clearOverlay();
-  setWorkflowState("waitingUserToStartAnswerScan", "Leitura pausada.");
+  const diagnostic = state.cardCaptureMode === "diagnosticPhoto";
+  setWorkflowState(
+    "waitingUserToStartAnswerScan",
+    diagnostic ? "Leitura pausada." : "Leitura pausada. Toque em iniciar quando estiver alinhado.",
+  );
   updateCardControls();
 }
 
 function disableAnswerCamera() {
   stopAnswerReading();
   stopAnswerCamera();
-  setWorkflowState("waitingUserToStartAnswerScan", 'Pronto. Toque em "Tirar foto do cartão" para capturar novamente.');
+  const diagnostic = state.cardCaptureMode === "diagnosticPhoto";
+  setWorkflowState(
+    "waitingUserToStartAnswerScan",
+    diagnostic
+      ? 'Pronto. Toque em "Tirar foto do cartão (diagnóstico)" para capturar novamente.'
+      : 'Pronto. Toque em "Iniciar leitura (tempo real)" para tentar novamente.',
+  );
   updateCardControls();
 }
 
@@ -1813,9 +2197,21 @@ async function enableAnswerCamera() {
     setStatus("OpenCV ainda está carregando.");
     return;
   }
-  setWorkflowState("waitingUserToStartAnswerScan");
-  updateCardControls();
-  openCardPhotoPicker();
+
+  if (state.cardCaptureMode === "diagnosticPhoto") {
+    setWorkflowState("waitingUserToStartAnswerScan");
+    updateCardControls();
+    openCardPhotoPicker();
+    return;
+  }
+
+  await startCardCamera();
+  if (!state.stream) {
+    setWorkflowState("error", "Falha ao abrir a câmera.");
+    updateCardControls();
+    return;
+  }
+  startCardReading();
 }
 
 function wireCardButtons() {
@@ -1874,7 +2270,7 @@ function detectCardAnswers(videoElement, questionCount) {
   const scale = Math.min(1, CARD_PROCESSING_MAX_WIDTH / Math.max(videoElement.videoWidth, 1));
   processingCanvas.width = Math.max(1, Math.round(videoElement.videoWidth * scale));
   processingCanvas.height = Math.max(1, Math.round(videoElement.videoHeight * scale));
-  const captureContext = processingCanvas.getContext("2d", { willReadFrequently: true });
+  const captureContext = processingCanvasContext || processingCanvas.getContext("2d", { willReadFrequently: true });
   captureContext.drawImage(videoElement, 0, 0, processingCanvas.width, processingCanvas.height);
 
   const src = cv.imread(processingCanvas);
@@ -2178,6 +2574,30 @@ function findMarkersV2(binaryMat, width, height) {
       return found;
     }
     // Fallback: componentes conectados costuma ser mais tolerante quando o contorno fica "quebrado" por blur/ruído.
+    const byComponents = collectMarkerCandidatesConnectedComponents(binaryMat, width, height);
+    return byComponents.length >= 4 ? byComponents : found;
+  } finally {
+    contours.delete();
+    hierarchy.delete();
+  }
+}
+
+// Versão otimizada para o modo tempo real:
+// - não executa busca combinatória (N^4) dos candidatos;
+// - retorna uma lista maior de candidatos para seleção por canto (guia verde).
+function findMarkersRealtime(binaryMat, width, height) {
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  try {
+    cv.findContours(binaryMat, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    const found = collectMarkerCandidatesFast(contours, width, height);
+    if (found.length >= 4) {
+      return found;
+    }
+    // Evita custo alto do connectedComponents quando ainda ha poucos sinais (ex.: cartao longe/fora do quadro).
+    if (found.length < 3) {
+      return found;
+    }
     const byComponents = collectMarkerCandidatesConnectedComponents(binaryMat, width, height);
     return byComponents.length >= 4 ? byComponents : found;
   } finally {
@@ -2709,6 +3129,74 @@ function collectMarkerCandidatesV3(contours, width, height) {
   }
 
   return best ? best.markers : unique.slice(0, 4);
+}
+
+// Coleta candidatos a marcadores com foco em performance (tempo real).
+// Mesma ideia do V3, mas sem etapa combinatória e com heurísticas mais leves.
+function collectMarkerCandidatesFast(contours, width, height) {
+  const candidates = [];
+  const frameArea = width * height;
+  const minArea = frameArea * MARKER_MIN_AREA_RATIO;
+  const maxArea = frameArea * MARKER_MAX_AREA_RATIO;
+  const minDim = Math.min(width, height);
+  const minSide = Math.max(5, Math.round(minDim * MARKER_MIN_SIDE_RATIO));
+  const maxSide = Math.max(24, Math.round(minDim * MARKER_MAX_SIDE_RATIO));
+
+  for (let index = 0; index < contours.size(); index += 1) {
+    const contour = contours.get(index);
+    const area = cv.contourArea(contour);
+    if (area < minArea || area > maxArea) {
+      contour.delete();
+      continue;
+    }
+
+    const rect = cv.boundingRect(contour);
+    contour.delete();
+
+    const rectWidth = Math.max(rect.width, rect.height);
+    const rectHeight = Math.min(rect.width, rect.height);
+    if (rectWidth < minSide || rectHeight < minSide || rectWidth > maxSide || rectHeight > maxSide) {
+      continue;
+    }
+
+    const aspect = rectWidth / Math.max(rectHeight, 1);
+    const fillRatio = area / Math.max(rect.width * rect.height, 1);
+    if (aspect < 0.66 || aspect > 1.52 || fillRatio < 0.44) {
+      continue;
+    }
+
+    const center = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+    const cornerScore = cornerProximityScore(center, width, height);
+    const aspectSquare = rectHeight / Math.max(rectWidth, 1);
+    const squareScore = clamp(aspectSquare * fillRatio, 0, 1);
+
+    candidates.push({
+      area,
+      center,
+      cornerScore,
+      squareScore,
+    });
+  }
+
+  candidates.sort((left, right) => {
+    const leftScore = (left.squareScore || 0) * 10000 + Math.sqrt(left.area || 0);
+    const rightScore = (right.squareScore || 0) * 10000 + Math.sqrt(right.area || 0);
+    return rightScore - leftScore;
+  });
+
+  const unique = [];
+  const dedupeDistance = Math.max(12, Math.round(minDim * 0.028));
+  for (const candidate of candidates) {
+    const duplicate = unique.some((item) => distance(item.center, candidate.center) < dedupeDistance);
+    if (!duplicate) {
+      unique.push(candidate);
+    }
+    if (unique.length >= 28) {
+      break;
+    }
+  }
+
+  return unique;
 }
 
 function rectangleScore(points, frameWidth, frameHeight) {
@@ -3340,12 +3828,11 @@ function answersSignature(answers, questionCount) {
 }
 
 function drawOverlay(corners) {
-  const width = state.elements.video.clientWidth || state.elements.video.videoWidth || 1;
-  const height = state.elements.video.clientHeight || state.elements.video.videoHeight || 1;
-  state.elements.overlayCanvas.width = width;
-  state.elements.overlayCanvas.height = height;
+  // Importante: não limpar nem redimensionar aqui.
+  // O guia verde (drawAnswerGuide) já limpa e desenha o overlay a cada tick.
+  const width = state.elements.overlayCanvas.width || state.elements.video.clientWidth || state.elements.video.videoWidth || 1;
+  const height = state.elements.overlayCanvas.height || state.elements.video.clientHeight || state.elements.video.videoHeight || 1;
   const context = state.elements.overlayCanvas.getContext("2d");
-  context.clearRect(0, 0, width, height);
 
   const scaleX = width / state.elements.video.videoWidth;
   const scaleY = height / state.elements.video.videoHeight;
@@ -3600,7 +4087,7 @@ async function processPhotoFromFile(file) {
 
       processingCanvas.width = rotation % 2 === 0 ? targetWidth : targetHeight;
       processingCanvas.height = rotation % 2 === 0 ? targetHeight : targetWidth;
-      const ctx = processingCanvas.getContext("2d", { willReadFrequently: true });
+      const ctx = processingCanvasContext || processingCanvas.getContext("2d", { willReadFrequently: true });
       ctx.imageSmoothingEnabled = true;
       try {
         ctx.imageSmoothingQuality = "high";
@@ -4194,11 +4681,12 @@ function distance(left, right) {
 }
 
 function setStatus(text) {
-  if (state.elements.scanStatus && !state.cardMode) {
-    state.elements.scanStatus.textContent = text;
+  const target = state.cardMode ? state.elements.cardStatus : state.elements.scanStatus;
+  if (!target) {
+    return;
   }
-  if (state.elements.cardStatus && state.cardMode) {
-    state.elements.cardStatus.textContent = text;
+  if (target.textContent !== text) {
+    target.textContent = text;
   }
 }
 
@@ -4243,6 +4731,27 @@ function updateDebugUi() {
   }
 }
 
+function handleCardCaptureModeToggle() {
+  const diagnostic = Boolean(state.elements?.debugToggle?.checked);
+  const nextMode = diagnostic ? "diagnosticPhoto" : "realtime";
+  const previousMode = state.cardCaptureMode;
+
+  state.cardCaptureMode = nextMode;
+  // Diagnóstico sempre liga debug; também permite ?debug=1.
+  state.debug = Boolean(getQueryFlag("debug")) || diagnostic;
+  updateDebugUi();
+
+  if (previousMode !== nextMode && state.workflow === "answerScanning") {
+    // Evita travas: ao alternar modo no meio da leitura, para tudo.
+    stopLoops();
+    stopAnswerCamera();
+    clearOverlay();
+    setWorkflowState("waitingUserToStartAnswerScan", "Modo alterado. Inicie a leitura novamente.");
+  }
+
+  updateCardControls();
+}
+
 function updateCardControls() {
   if (!state.cardMode) {
     setCameraPanelVisible(state.workflow === "qrScanning");
@@ -4250,42 +4759,54 @@ function updateCardControls() {
   }
 
   const scanning = state.workflow === "answerScanning";
-  const photoReady = state.workflow === "answerDetected";
+  const done = state.workflow === "answerDetected";
+  const diagnostic = state.cardCaptureMode === "diagnosticPhoto";
 
-  // Para máxima estabilidade no celular, usamos captura por foto via câmera nativa (input file).
-  // Não mantemos preview interno aberto durante a leitura do cartão.
-  setCameraPanelVisible(false);
+  // Modo padrão: preview em tempo real. Diagnóstico: captura por foto (câmera nativa).
+  setCameraPanelVisible(!diagnostic && scanning);
+
+  if (state.elements?.cardHint) {
+    if (diagnostic) {
+      state.elements.cardHint.textContent =
+        "Modo diagnóstico (por foto): tire uma foto do cartão com os 4 quadradinhos pretos visíveis.";
+    } else if (scanning) {
+      state.elements.cardHint.textContent =
+        "Modo padrão (tempo real): alinhe os 4 quadradinhos nos cantos do retângulo verde e mantenha o celular estável.";
+    } else {
+      state.elements.cardHint.textContent =
+        "Modo padrão (tempo real): alinhe o cartão no retângulo verde e toque em iniciar. A leitura fecha automaticamente quando estiver estável.";
+    }
+  }
 
   // Novo layout (index.html atualizado)
   if (state.elements?.enableCameraButton) {
-    state.elements.enableCameraButton.classList.toggle("hidden", scanning || photoReady);
-    state.elements.enableCameraButton.disabled = scanning || !state.opencvReady;
+    state.elements.enableCameraButton.classList.toggle("hidden", scanning || done);
+    state.elements.enableCameraButton.disabled = !state.opencvReady;
+    state.elements.enableCameraButton.textContent = diagnostic
+      ? "Tirar foto do cartão (diagnóstico)"
+      : "Iniciar leitura (tempo real)";
 
-    if (state.elements.capturePhotoButton) {
-      // Fluxo antigo (preview interno) desativado.
-      state.elements.capturePhotoButton.classList.add("hidden");
-      state.elements.capturePhotoButton.disabled = true;
+    if (state.elements.disableCameraButton) {
+      state.elements.disableCameraButton.classList.toggle("hidden", !scanning);
+      state.elements.disableCameraButton.disabled = false;
     }
 
     if (state.elements.retakePhotoButton) {
-      state.elements.retakePhotoButton.classList.toggle("hidden", scanning || !photoReady);
+      // Em ambos os modos: permite tentar novamente depois que terminar.
+      state.elements.retakePhotoButton.classList.toggle("hidden", scanning || !done);
       state.elements.retakePhotoButton.disabled = scanning;
+      state.elements.retakePhotoButton.textContent = diagnostic ? "Tirar nova foto" : "Ler novamente";
     }
 
     if (state.elements.confirmReadingButton) {
-      state.elements.confirmReadingButton.classList.toggle("hidden", !photoReady);
+      state.elements.confirmReadingButton.classList.toggle("hidden", !done);
       state.elements.confirmReadingButton.disabled = false;
     }
 
     if (state.elements.cancelReadingButton) {
-      const showCancel = photoReady || scanning;
-      state.elements.cancelReadingButton.classList.toggle("hidden", !showCancel);
+      // Mantém "Cancelar" apenas quando o resultado já existe.
+      state.elements.cancelReadingButton.classList.toggle("hidden", scanning || !done);
       state.elements.cancelReadingButton.disabled = false;
-    }
-
-    if (state.elements.disableCameraButton) {
-      state.elements.disableCameraButton.classList.add("hidden");
-      state.elements.disableCameraButton.disabled = true;
     }
     return;
   }

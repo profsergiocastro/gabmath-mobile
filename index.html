@@ -41,16 +41,17 @@
       <div id="step-card" class="step hidden">
         <h2>Cartão-resposta</h2>
         <div id="proof-summary" class="summary"></div>
-        <p class="hint">Tire uma foto do cartão-resposta com os quatro quadradinhos pretos visíveis e boa iluminação.</p>
+        <p id="card-hint" class="hint">Alinhe o cartão no retângulo verde. No modo padrão (tempo real) a leitura fecha automaticamente quando estiver estável.</p>
         <div class="actions single-column">
-          <button id="enable-camera" class="full">Tirar foto do cartão</button>
+          <button id="enable-camera" class="full">Iniciar leitura (tempo real)</button>
+          <button id="disable-camera" class="secondary full hidden">Parar câmera</button>
           <button id="retake-photo" class="secondary full hidden">Tirar nova foto</button>
           <button id="cancel-reading" class="secondary full hidden">Cancelar</button>
         </div>
         <input id="card-photo-input" class="file-input-hidden" type="file" accept="image/*" capture="environment">
         <label class="debug-toggle">
           <input id="debug-toggle" type="checkbox">
-          Modo diagnóstico da leitura
+          Modo diagnóstico (por foto)
         </label>
         <p id="card-status" class="status"></p>
         <canvas id="aligned-preview" class="aligned-preview"></canvas>
