@@ -425,3 +425,20 @@ button.full {
   font-size: 0.88rem;
   word-break: break-word;
 }
+
+.confirm-message {
+  margin: 2px 0 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #e8f7ea;
+  border: 1px solid #cfe5d1;
+  color: #1b5e20;
+  font-weight: 700;
+  text-align: center;
+}
+
+.confirm-message.error {
+  background: #fff3f2;
+  border-color: #efc8c3;
+  color: #b3261e;
+}

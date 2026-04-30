@@ -172,6 +172,7 @@ function initializeQrPage() {
     capturePhotoButton: document.getElementById("capture-photo"),
     retakePhotoButton: document.getElementById("retake-photo"),
     confirmReadingButton: document.getElementById("confirm-reading"),
+    confirmMessage: document.getElementById("confirm-message"),
     cancelReadingButton: document.getElementById("cancel-reading"),
     disableCameraButton: document.getElementById("disable-camera"),
     cardPhotoInput: document.getElementById("card-photo-input"),
@@ -242,6 +243,7 @@ function initializeCardPage() {
     capturePhotoButton: document.getElementById("capture-photo"),
     retakePhotoButton: document.getElementById("retake-photo"),
     confirmReadingButton: document.getElementById("confirm-reading"),
+    confirmMessage: document.getElementById("confirm-message"),
     cancelReadingButton: document.getElementById("cancel-reading"),
     disableCameraButton: document.getElementById("disable-camera"),
     cardPhotoInput: document.getElementById("card-photo-input"),
@@ -2020,6 +2022,7 @@ function startCardReading() {
   state.stableCount = 0;
   state.lastDetection = null;
   state.lastResult = null;
+  clearConfirmMessage();
   if (state.elements.resultPanel) {
     state.elements.resultPanel.classList.add("hidden");
     state.elements.resultPanel.innerHTML = "";
@@ -3983,6 +3986,27 @@ function correctProof() {
   setStatus("Leitura concluída.");
 }
 
+function clearConfirmMessage() {
+  const messageEl = state.elements?.confirmMessage;
+  if (!messageEl) {
+    return;
+  }
+  messageEl.textContent = "";
+  messageEl.classList.add("hidden");
+  messageEl.classList.remove("error");
+}
+
+function showConfirmMessage(text, { error = false } = {}) {
+  const messageEl = state.elements?.confirmMessage;
+  if (!messageEl) {
+    return;
+  }
+  const content = String(text || "");
+  messageEl.textContent = content;
+  messageEl.classList.toggle("error", Boolean(error));
+  messageEl.classList.toggle("hidden", !content.trim());
+}
+
 function resetReadingUi() {
   state.answers = {};
   state.stableSignature = "";
@@ -3990,6 +4014,7 @@ function resetReadingUi() {
   state.lastDetection = null;
   state.lastResult = null;
   state.lastPhotoMeta = null;
+  clearConfirmMessage();
   if (state.elements?.resultPanel) {
     state.elements.resultPanel.classList.add("hidden");
     state.elements.resultPanel.innerHTML = "";
@@ -4203,8 +4228,10 @@ function retakePhoto() {
 }
 
 function confirmReading() {
+  clearConfirmMessage();
   if (!state.proof || !state.lastResult) {
     setStatus("Nenhum resultado para confirmar.");
+    showConfirmMessage("Nenhum resultado para confirmar.", { error: true });
     return;
   }
 
@@ -4213,6 +4240,7 @@ function confirmReading() {
     const typed = window.prompt("Informe o nome do aluno:", "");
     if (!typed || !String(typed).trim()) {
       setStatus("Informe o nome do aluno para salvar o resultado.");
+      showConfirmMessage("Informe o nome do aluno para salvar o resultado.", { error: true });
       return;
     }
     state.proof.aluno = String(typed).trim();
@@ -4226,10 +4254,12 @@ function confirmReading() {
     });
   } catch (error) {
     setStatus(error?.message || String(error));
+    showConfirmMessage(error?.message || String(error), { error: true });
     return;
   }
 
   setStatus("Resultado salvo com sucesso.");
+  showConfirmMessage("Resultado salvo com sucesso.");
 }
 
 function cancelReading() {
