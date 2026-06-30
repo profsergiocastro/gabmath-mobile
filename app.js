@@ -1,3 +1,7 @@
+const OPENCV_CDN_URL = "https://docs.opencv.org/4.10.0/opencv.js";
+const OPENCV_LOAD_TIMEOUT = 90000;
+let openCvLoadPromise = null;
+
 const QR_PAYLOAD_PREFIX = "GABMATH1:";
 const STORAGE_KEY = "gabmath-current-proof";
 const RESULTS_STORAGE_KEY = "gabmath-exam-results-v1";
@@ -13,18 +17,10 @@ const CARD_TARGET = {
 const CARD_PROCESSING_MAX_WIDTH = 960;
 const PHOTO_PROCESSING_MAX_WIDTH = 2200;
 const PHOTO_PROCESSING_FALLBACK_MAX_WIDTH = 3600;
-// Modo tempo real: processamento amostrado (não processa todo frame).
-// Aumentar um pouco o intervalo reduz travamentos em celulares mais fracos.
 const CARD_FRAME_INTERVAL_MS = 200;
 const MIN_FOCUS_SCORE = 120;
-// Quantos frames consecutivos precisam estar estáveis antes de capturar.
 const REQUIRED_STABLE_FRAMES = 3;
-// Resolução máxima do frame usado para detectar marcadores em tempo real.
-// Menor = mais rápido; a leitura final usa um frame maior.
 const REALTIME_DETECTION_MAX_WIDTH = 560;
-// Score mínimo para aceitar o quadrilátero dos 4 marcadores.
-// Valor mais baixo permite foto com o cartão mais distante (menor na imagem),
-// mas ainda rejeita casos onde a geometria fica inconsistente.
 const MIN_CARD_RECTANGLE_SCORE = 0.015;
 const GOOD_CARD_RECTANGLE_SCORE = 0.075;
 const MIN_MARKER_FILL_RATIO = 0.62;
@@ -32,22 +28,14 @@ const MIN_MARKER_SIDE = 16;
 const MAX_MARKER_SIDE = 90;
 const MIN_FILLED_BUBBLE_SCORE = 0.24;
 const SECOND_BUBBLE_RELATIVE_LIMIT = 0.86;
-
-// Leitura v2 (mais robusta para bolhas circulares, com limiar adaptativo).
 const BUBBLE_CONTRAST_MIN = 0.085;
 const BUBBLE_AMBIGUOUS_RELATIVE = 0.9;
 const BUBBLE_AMBIGUOUS_GAP = 0.035;
-// Não assumimos que o cartão esteja próximo aos cantos da foto.
-// (O aluno pode fotografar mais distante e o cartão ficar centralizado.)
-// Mantido apenas por compatibilidade; não usamos mais como fator de decisão.
 const MARKER_CORNER_BONUS = 0.0;
 const CARD_ASPECT = CARD_TARGET.width / CARD_TARGET.height;
 const MARKER_RECT_ASPECT = (CARD_TARGET.rightMarkerX - CARD_TARGET.leftMarkerX) / Math.max((CARD_TARGET.bottomMarkerY - CARD_TARGET.topMarkerY), 1);
-
-// Marcadores (multiescala): aceitar quadrados pequenos (cartão longe) e grandes (cartão perto).
 const MARKER_MIN_AREA_RATIO = 0.000006;
 const MARKER_MAX_AREA_RATIO = 0.015;
-// Permite marcadores menores quando a foto é tirada mais distante.
 const MARKER_MIN_SIDE_RATIO = 0.0028;
 const MARKER_MAX_SIDE_RATIO = 0.28;
 
@@ -2064,25 +2052,87 @@ function commitQrAndGo(rawValue) {
   }
 }
 
-function waitForOpenCv() {
+function startOpenCvLoad() {
+  if (openCvLoadPromise) {
+    return openCvLoadPromise;
+  }
   if (window.cv && typeof window.cv.Mat === "function") {
-    state.opencvReady = true;
-    state.opencvKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+    openCvLoadPromise = Promise.resolve();
+    return openCvLoadPromise;
+  }
+  openCvLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = OPENCV_CDN_URL;
+    script.async = true;
+    script.onload = () => {
+      const check = () => {
+        if (window.cv && typeof window.cv.Mat === "function") {
+          resolve();
+        } else {
+          setTimeout(check, 100);
+        }
+      };
+      setTimeout(check, 200);
+    };
+    script.onerror = () => {
+      openCvLoadPromise = null;
+      reject(new Error("Falha ao baixar OpenCV.js. Verifique sua conexao."));
+    };
+    document.head.appendChild(script);
+    setTimeout(() => {
+      openCvLoadPromise = null;
+      reject(new Error("Tempo limite excedido ao carregar OpenCV (90s)."));
+    }, OPENCV_LOAD_TIMEOUT);
+  });
+  return openCvLoadPromise;
+}
+
+function waitForOpenCv() {
+  if (state.opencvReady) {
     onOpenCvReady();
     return;
   }
-
-  const timer = setInterval(() => {
-    if (window.cv && typeof window.cv.Mat === "function") {
-      clearInterval(timer);
+  const statusTarget = state.cardMode ? state.elements.cardStatus : state.elements.scanStatus;
+  const prevText = statusTarget?.textContent || "";
+  startOpenCvLoad().then(() => {
+    if (!state.opencvReady) {
       state.opencvReady = true;
       state.opencvKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
       if (state.page === "card") {
         setStatus("OpenCV carregado. Agora voce pode iniciar a leitura do cartao.");
+      } else {
+        setStatus("Aponte a camera apenas para o QR Code.");
       }
       onOpenCvReady();
     }
-  }, 250);
+  }).catch((error) => {
+    setStatus("Erro: " + error.message + " Recarregue a pagina ou toque em \"Tentar novamente\".");
+    const buttons = [
+      state.elements?.enableCameraButton,
+      state.elements?.startCardScanButton,
+      state.elements?.startScanButton,
+    ];
+    for (const btn of buttons) {
+      if (btn) btn.disabled = true;
+    }
+    const reloadBtn = document.createElement("button");
+    reloadBtn.textContent = "Tentar novamente";
+    reloadBtn.className = "full";
+    reloadBtn.style.marginTop = "8px";
+    reloadBtn.addEventListener("click", () => {
+      openCvLoadPromise = null;
+      state.opencvReady = false;
+      if (statusTarget) statusTarget.textContent = prevText;
+      reloadBtn.remove();
+      for (const btn of buttons) {
+        if (btn) btn.disabled = false;
+      }
+      waitForOpenCv();
+    });
+    if (statusTarget && statusTarget.parentNode) {
+      statusTarget.parentNode.insertBefore(reloadBtn, statusTarget.nextSibling);
+    }
+  });
 }
 
 function onOpenCvReady() {
