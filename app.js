@@ -1,5 +1,9 @@
-const OPENCV_CDN_URL = "https://docs.opencv.org/4.10.0/opencv.js";
-const OPENCV_LOAD_TIMEOUT = 90000;
+const OPENCV_CDN_URLS = [
+  "https://docs.opencv.org/4.10.0/opencv.js",
+  "https://cdn.jsdelivr.net/npm/@opencv/opencv-wasm@1.0.0/dist/esm/opencv.js",
+  "https://docs.opencv.org/4.9.0/opencv.js",
+];
+const OPENCV_URL_TIMEOUT = 60000;
 let openCvLoadPromise = null;
 
 const QR_PAYLOAD_PREFIX = "GABMATH1:";
@@ -2052,6 +2056,39 @@ function commitQrAndGo(rawValue) {
   }
 }
 
+function tryLoadUrl(url) {
+  return new Promise((resolve, reject) => {
+    if (window.cv && typeof window.cv.Mat === "function") {
+      resolve();
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = url;
+    script.async = true;
+    const timeout = setTimeout(() => {
+      script.onload = null;
+      script.onerror = null;
+      reject(new Error("Timeout"));
+    }, OPENCV_URL_TIMEOUT);
+    script.onload = () => {
+      clearTimeout(timeout);
+      const check = () => {
+        if (window.cv && typeof window.cv.Mat === "function") {
+          resolve();
+        } else {
+          setTimeout(check, 200);
+        }
+      };
+      setTimeout(check, 500);
+    };
+    script.onerror = () => {
+      clearTimeout(timeout);
+      reject(new Error("Falha ao baixar"));
+    };
+    document.head.appendChild(script);
+  });
+}
+
 function startOpenCvLoad() {
   if (openCvLoadPromise) {
     return openCvLoadPromise;
@@ -2060,30 +2097,18 @@ function startOpenCvLoad() {
     openCvLoadPromise = Promise.resolve();
     return openCvLoadPromise;
   }
-  openCvLoadPromise = new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = OPENCV_CDN_URL;
-    script.async = true;
-    script.onload = () => {
-      const check = () => {
-        if (window.cv && typeof window.cv.Mat === "function") {
-          resolve();
-        } else {
-          setTimeout(check, 100);
-        }
-      };
-      setTimeout(check, 200);
-    };
-    script.onerror = () => {
-      openCvLoadPromise = null;
-      reject(new Error("Falha ao baixar OpenCV.js. Verifique sua conexao."));
-    };
-    document.head.appendChild(script);
-    setTimeout(() => {
-      openCvLoadPromise = null;
-      reject(new Error("Tempo limite excedido ao carregar OpenCV (90s)."));
-    }, OPENCV_LOAD_TIMEOUT);
-  });
+  const attempt = (index) => {
+    if (index >= OPENCV_CDN_URLS.length) {
+      return Promise.reject(new Error("Todas as fontes do OpenCV falharam."));
+    }
+    const url = OPENCV_CDN_URLS[index];
+    setStatus("Carregando OpenCV (" + (index + 1) + "/" + OPENCV_CDN_URLS.length + ")...");
+    return tryLoadUrl(url).catch(() => {
+      setStatus("Fonte " + (index + 1) + " falhou. Tentando alternativa " + (index + 2) + "/" + OPENCV_CDN_URLS.length + "...");
+      return attempt(index + 1);
+    });
+  };
+  openCvLoadPromise = attempt(0);
   return openCvLoadPromise;
 }
 
