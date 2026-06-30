@@ -1,7 +1,7 @@
 const OPENCV_CDN_URLS = [
-  "https://docs.opencv.org/4.10.0/opencv.js",
-  "https://cdn.jsdelivr.net/npm/@opencv/opencv-wasm@1.0.0/dist/esm/opencv.js",
   "https://docs.opencv.org/4.9.0/opencv.js",
+  "https://docs.opencv.org/4.8.0/opencv.js",
+  "https://docs.opencv.org/4.5.5/opencv.js",
 ];
 const OPENCV_URL_TIMEOUT = 60000;
 let openCvLoadPromise = null;
