@@ -1,9 +1,12 @@
 const OPENCV_CDN_URLS = [
+  "https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.9.0-release.3/dist/opencv.js",
   "https://docs.opencv.org/4.9.0/opencv.js",
+  "https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.8.0-release.10/dist/opencv.js",
   "https://docs.opencv.org/4.8.0/opencv.js",
+  "https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.5.5-release.2/dist/opencv.js",
   "https://docs.opencv.org/4.5.5/opencv.js",
 ];
-const OPENCV_URL_TIMEOUT = 60000;
+const OPENCV_URL_TIMEOUT = 30000;
 let openCvLoadPromise = null;
 
 const QR_PAYLOAD_PREFIX = "GABMATH1:";
