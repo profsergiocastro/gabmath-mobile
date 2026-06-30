@@ -2131,11 +2131,10 @@ function waitForOpenCv() {
       onOpenCvReady();
     }
   }).catch((error) => {
-    setStatus("Erro: " + error.message + " Recarregue a pagina ou toque em \"Tentar novamente\".");
+    setStatus("OpenCV indisponivel. QR continua funcionando, mas a leitura do cartao requer OpenCV. " + error.message + ' Toque em "Tentar novamente".');
     const buttons = [
       state.elements?.enableCameraButton,
       state.elements?.startCardScanButton,
-      state.elements?.startScanButton,
     ];
     for (const btn of buttons) {
       if (btn) btn.disabled = true;
